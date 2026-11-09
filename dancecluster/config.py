@@ -33,6 +33,42 @@ def settings_path() -> Path:
     return app_data_dir() / "config.json"
 
 
+_instance_lock_handle = None
+
+
+def acquire_instance_lock() -> bool:
+    """单实例锁：成功返回 True 并保持文件句柄，已被占用返回 False。
+
+    用操作系统级文件锁（Windows msvcrt / POSIX fcntl），进程退出自动释放，
+    不会因异常退出留下死锁。拿不到锁文件时（如只读环境）放行，避免误伤。
+    """
+    global _instance_lock_handle
+    try:
+        path = app_data_dir() / "instance.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")
+    except OSError:
+        return True
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            if os.path.getsize(path) == 0:
+                f.write("1")
+                f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    _instance_lock_handle = f
+    return True
+
+
 def load_settings() -> dict:
     p = settings_path()
     if p.exists():
@@ -92,7 +128,7 @@ class MatchConfig:
     dtw_window_ratio: float = 0.08
     # 音乐相似度阈值（0~1，越高越严格）
     music_threshold: float = 0.60
-    # 动作相似度阈值（0~1，越高越严格）
+    # 动作距离阈值（DTW 归一化距离，特征已逐帧 L2 归一化，越小越严格）
     dance_threshold: float = 0.35
     mirror_invariant: bool = True     # 镜像视为同一支舞
     multi_segment: bool = True        # 多段采样取最佳匹配

@@ -19,6 +19,9 @@ from .db import Store
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
+# 特征算法版本：改动特征计算后 +1，老缓存会自动被标记重提取
+FEATURE_VERSION = 2
+
 
 @dataclass
 class Record:
@@ -181,8 +184,65 @@ def index_video(
         rec.status = "error"
         rec.error = f"{type(exc).__name__}: {exc}"
 
-    store.set_status(vid, rec.status, rec.error)
+    store.set_status(vid, rec.status, rec.error, feature_version=FEATURE_VERSION)
     return rec
+
+
+def ensure_video_cache(row: dict, cfg: AppConfig) -> Path:
+    """按需补建某个视频的中间文件（clip / pose / audio），供预览与骨架渲染用。
+
+    不写数据库特征、不改变分组结果，只补磁盘文件；缺失才重建，存在则跳过。
+    源视频不存在时抛 FileNotFoundError。
+    """
+    src = Path(row["path"])
+    if not src.exists():
+        raise FileNotFoundError(f"源视频不存在：{src}")
+    cdir = Path(row["cache_dir"])
+    cdir.mkdir(parents=True, exist_ok=True)
+
+    clip = cdir / "clip.mp4"
+    if not clip.exists():
+        ffmpeg.cut_clip(
+            src, clip, cfg.clip.start, cfg.clip.duration,
+            cfg.clip.reencode, max_height=cfg.clip.max_height,
+        )
+
+    m4a = cdir / "audio.m4a"
+    wav = cdir / "audio.wav"
+    if not m4a.exists() and not wav.exists():
+        adur = cfg.clip.audio_duration if cfg.clip.audio_duration > 0 else None
+        ffmpeg.extract_audio(src, wav, start=0.0, duration=adur, sample_rate=cfg.audio.sample_rate)
+    if not m4a.exists() and wav.exists():
+        try:
+            ffmpeg.to_aac(wav, m4a, bitrate="96k")
+        except Exception:
+            pass
+
+    pose_npz = cdir / "pose.npz"
+    if not pose_npz.exists():
+        # 显式创建 landmarker 并后台关闭，避免 extract_pose 内部 close() 阻塞 ~60s 遥测
+        lm = pose.create_landmarker(
+            cfg.pose.model_path,
+            num_poses=cfg.pose.num_poses,
+            min_detection_confidence=cfg.pose.min_detection_confidence,
+            min_presence_confidence=cfg.pose.min_presence_confidence,
+            min_tracking_confidence=cfg.pose.min_tracking_confidence,
+        )
+        try:
+            seq = pose.extract_pose(
+                str(clip), cfg.pose.model_path,
+                num_poses=cfg.pose.num_poses,
+                analysis_fps=max(cfg.pose.target_fps, 10.0),
+                min_detection_confidence=cfg.pose.min_detection_confidence,
+                min_presence_confidence=cfg.pose.min_presence_confidence,
+                min_tracking_confidence=cfg.pose.min_tracking_confidence,
+                smooth_window=cfg.pose.smooth_window,
+                landmarker=lm,
+            )
+            seq.save(pose_npz)
+        finally:
+            _close_async(lm)
+    return cdir
 
 
 def _close_async(landmarker) -> None:
@@ -262,7 +322,11 @@ def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None)
     ts_offset = 0.0
     try:
         store.reset_stale_extracting()
-        pending = [r for r in store.all_videos() if r["status"] in ("pending", "error")]
+        pending = [
+            r for r in store.all_videos()
+            if r["status"] in ("pending", "error")
+            or (r["status"] in ("ok", "no_pose") and (r["feature_version"] or 0) != FEATURE_VERSION)
+        ]
         if only_ids is not None:
             idset = set(int(x) for x in only_ids)
             pending = [r for r in pending if int(r["id"]) in idset]

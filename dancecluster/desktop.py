@@ -12,7 +12,7 @@ import threading
 
 import webview
 
-from . import webui
+from . import config, webui
 
 
 def _setup_tray(window, quitting: dict):
@@ -59,6 +59,9 @@ def _setup_tray(window, quitting: dict):
 
 
 def main() -> int:
+    if not config.acquire_instance_lock():
+        print("DanceCluster 已在运行，请勿重复启动。", file=sys.stderr)
+        return 0
     port = webui._free_port()
     url = f"http://127.0.0.1:{port}"
     print(f"DanceCluster 桌面模式：{url}", flush=True)

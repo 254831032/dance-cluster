@@ -95,6 +95,30 @@ def _store() -> Store:
     return Store(pipeline.db_path(_cfg()))
 
 
+_ensure_locks: dict = {}
+_ensure_locks_guard = threading.Lock()
+
+
+def _ensure_cache(row) -> bool:
+    """预览前确保该视频的中间文件存在；缺失则从源视频按需重建。
+
+    带 per-video 锁，避免并发预览触发重复提取。源视频缺失时返回 False。
+    """
+    vid = int(row["id"])
+    with _ensure_locks_guard:
+        lock = _ensure_locks.setdefault(vid, threading.Lock())
+    with lock:
+        cdir = Path(row["cache_dir"])
+        needed = (cdir / "clip.mp4", cdir / "pose.npz", cdir / "audio.m4a")
+        if all(p.exists() for p in needed):
+            return True
+        try:
+            pipeline.ensure_video_cache(row, _cfg())
+        except Exception:
+            return False
+    return True
+
+
 def _snapshot() -> dict:
     with _lock:
         return {
@@ -374,6 +398,8 @@ def preview_video(video_id):
         store.close()
     if not row:
         return ("", 404)
+    if not _ensure_cache(row):
+        return ("", 404)
     cdir = Path(row["cache_dir"])
     pose_npz = cdir / "pose.npz"
     audio = cdir / "audio.m4a"
@@ -402,6 +428,8 @@ def skeleton_gif(video_id):
         store.close()
     if not row:
         return ("", 404)
+    if not _ensure_cache(row):
+        return ("", 404)
     pose_npz = Path(row["cache_dir"]) / "pose.npz"
     if not pose_npz.exists():
         return ("", 404)
@@ -428,6 +456,8 @@ def skeleton_frame(video_id):
     finally:
         store.close()
     if not row:
+        return ("", 404)
+    if not _ensure_cache(row):
         return ("", 404)
     pose_npz = Path(row["cache_dir"]) / "pose.npz"
     if not pose_npz.exists():
@@ -470,6 +500,8 @@ def clip_stream(video_id):
         store.close()
     if not row:
         return ("", 404)
+    if not _ensure_cache(row):
+        return ("", 404)
     return _stream(Path(row["cache_dir"]) / "clip.mp4")
 
 
@@ -481,6 +513,8 @@ def audio_stream(video_id):
     finally:
         store.close()
     if not row:
+        return ("", 404)
+    if not _ensure_cache(row):
         return ("", 404)
     cdir = Path(row["cache_dir"])
     m4a = cdir / "audio.m4a"
@@ -756,6 +790,9 @@ def _free_port(start: int = 8765) -> int:
 
 
 def main(open_browser: bool = True) -> int:
+    if not config.acquire_instance_lock():
+        print("DanceCluster 已在运行，请勿重复启动。", file=sys.stderr)
+        return 0
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
     print(f"DanceCluster 已启动：{url}", flush=True)

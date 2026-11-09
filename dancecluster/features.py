@@ -122,10 +122,16 @@ def resample(x: np.ndarray, src_fps: float, target_fps: float) -> np.ndarray:
 
 
 def feature_vector(x: np.ndarray) -> np.ndarray:
-    """(F,33,3) -> (F, 8+8*3) 的定长帧特征：关节角 + 关键点人体坐标。"""
+    """(F,33,3) -> (F, 8+8*3) 的定长帧特征：关节角 + 关键点人体坐标。
+
+    每帧做 L2 归一化：只比较「姿态形状」（方向），忽略幅度。
+    否则同一支舞因动作幅度/身材差异会拉大欧氏距离，被误判成不同动作。
+    """
     ang = joint_angles(x)
     pos = x[:, POSITION_JOINTS].reshape(x.shape[0], -1)
-    return np.concatenate([ang, pos], axis=1).astype(np.float32)
+    v = np.concatenate([ang, pos], axis=1).astype(np.float32)
+    norm = np.linalg.norm(v, axis=1, keepdims=True)
+    return v / np.maximum(norm, EPS)
 
 
 def prepare_coords(

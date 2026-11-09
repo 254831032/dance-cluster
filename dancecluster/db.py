@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS videos (
     confidence    REAL,
     audio_npz     BLOB,
     motion_npz    BLOB,
+    feature_version INTEGER DEFAULT 0,
     updated_at    TEXT
 );
 
@@ -108,6 +109,11 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        # 迁移：老库补 feature_version 列
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(videos)")}
+        if "feature_version" not in cols:
+            self.conn.execute("ALTER TABLE videos ADD COLUMN feature_version INTEGER DEFAULT 0")
+            self.conn.commit()
 
     def close(self) -> None:
         self.conn.commit()
@@ -136,11 +142,18 @@ class Store:
         self.conn.commit()
         return vid
 
-    def set_status(self, video_id: int, status: str, error: str = "") -> None:
-        self.conn.execute(
-            "UPDATE videos SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-            (status, error, _now(), video_id),
-        )
+    def set_status(self, video_id: int, status: str, error: str = "",
+                   feature_version: int | None = None) -> None:
+        if feature_version is None:
+            self.conn.execute(
+                "UPDATE videos SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                (status, error, _now(), video_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE videos SET status = ?, error = ?, feature_version = ?, updated_at = ? WHERE id = ?",
+                (status, error, feature_version, _now(), video_id),
+            )
         self.conn.commit()
 
     def set_audio(self, video_id: int, audio: dict, tempo: float) -> None:
