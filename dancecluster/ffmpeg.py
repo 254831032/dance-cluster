@@ -13,6 +13,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# Windows 下避免每个 ffmpeg/ffprobe 调用都弹出命令行窗口
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 
 def _tool(name: str) -> str:
     env = os.environ.get(f"DANCECLUSTER_{name.upper()}")
@@ -39,7 +42,7 @@ def ffprobe() -> str:
 
 
 def _run(cmd: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-8:])
         raise RuntimeError(f"命令失败({proc.returncode}): {' '.join(cmd)}\n{tail}")

@@ -18,6 +18,8 @@ import numpy as np
 DEFAULT_SR = 22050
 EPS = 1e-9
 
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 
 def load_audio(path: str, sr: int = DEFAULT_SR) -> np.ndarray:
     """读成单声道 float32。"""
@@ -151,7 +153,8 @@ def fingerprint(path: str) -> np.ndarray | None:
         return None
     try:
         out = subprocess.run(
-            [exe, "-raw", str(path)], capture_output=True, text=True, timeout=180
+            [exe, "-raw", str(path)], capture_output=True, text=True, timeout=180,
+            creationflags=_NO_WINDOW,
         ).stdout
     except Exception:
         return None

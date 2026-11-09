@@ -1024,6 +1024,17 @@ INDEX_HTML = r"""<!doctype html>
   </main>
 </div>
 
+<div class="modal" id="preview-modal" style="display:none">
+  <div class="modal-box">
+    <div class="modal-head"><b id="preview-name"></b><button class="ghost small" id="preview-close">✕ 关闭</button></div>
+    <div class="modal-body">
+      <div class="pv"><div class="pv-title">原视频</div><video id="pv-video" controls playsinline></video></div>
+      <div class="pv"><div class="pv-title">动作片段（前 20 秒）</div><video id="pv-clip" controls playsinline></video></div>
+      <div class="pv"><div class="pv-title">提取的音频</div><audio id="pv-audio" controls></audio></div>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), selTask:new Set(), search:"", fMusic:new Set(), fDance:new Set() };
@@ -1422,16 +1433,6 @@ async function loadGroups(type) {
 // ---- 启动 ----
 (async function init(){ await refreshConfig(); if (st.configured) { switchView("task"); refreshTask(); } })();
 </script>
-<div class="modal" id="preview-modal" style="display:none">
-  <div class="modal-box">
-    <div class="modal-head"><b id="preview-name"></b><button class="ghost small" id="preview-close">✕ 关闭</button></div>
-    <div class="modal-body">
-      <div class="pv"><div class="pv-title">原视频</div><video id="pv-video" controls playsinline></video></div>
-      <div class="pv"><div class="pv-title">动作片段（前 20 秒）</div><video id="pv-clip" controls playsinline></video></div>
-      <div class="pv"><div class="pv-title">提取的音频</div><audio id="pv-audio" controls></audio></div>
-    </div>
-  </div>
-</div>
 </body>
 </html>
 """

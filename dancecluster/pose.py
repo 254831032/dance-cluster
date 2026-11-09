@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +22,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parents[1] / 
 import mediapipe as mp  # noqa: E402
 
 NUM_LANDMARKS = 33
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 # MediaPipe Pose 骨架连线（用于叠加渲染）
 POSE_CONNECTIONS = [
@@ -401,7 +403,7 @@ def render_preview_video(pose_path, audio_path, out_mp4, fps=6, width=320, aspec
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
             "-c:a", "aac", "-b:a", "96k", "-shortest", str(out_mp4),
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(cmd, check=True, capture_output=True, creationflags=_NO_WINDOW)
         return out_mp4
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
