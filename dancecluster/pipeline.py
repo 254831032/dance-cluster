@@ -1,21 +1,21 @@
 """端到端流水线：索引 → 音乐分组 → 动作分组 → 报告/导出。
 
-分两阶段（准确度优先）：
-  阶段一 index：逐视频切片段、提音频特征、提骨架特征（可断点续跑，结果落盘）
-  阶段二 group：统一算音乐相似度 → 音乐分组 → 组内算动作距离 → 动作聚类
+数据全部落在一个 SQLite 文件里（<cache>/dancecluster.db）：
+  * 断点续跑：已提取的视频直接复用
+  * 分组结果写回库，方便以后做「手动合并/拆分、重新导出」
 """
 
 from __future__ import annotations
 
-import json
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from . import audio, clustering, dtw, features, ffmpeg, pose
 from .config import AppConfig
+from .db import Store
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
@@ -32,6 +32,7 @@ class Record:
     status: str = "pending"      # ok / no_pose / no_audio / error
     error: str = ""
     cache: str = ""
+    id: int = 0
 
 
 @dataclass
@@ -43,12 +44,17 @@ class Result:
     dance_labels: np.ndarray
     tempo: np.ndarray
     confidence: np.ndarray
+    db_path: str = ""
 
 
 def list_videos(root: str | Path) -> list[Path]:
     root = Path(root)
     files = [p for p in root.rglob("*") if p.suffix.lower() in VIDEO_EXTS and p.is_file()]
     return sorted(files, key=lambda p: p.name.lower())
+
+
+def db_path(cfg: AppConfig) -> Path:
+    return Path(cfg.cache_dir) / "dancecluster.db"
 
 
 def _cache_dir(cfg: AppConfig, name: str) -> Path:
@@ -62,13 +68,41 @@ def _safe(name: str) -> str:
     return keep[:80] or "video"
 
 
-def index_video(path: Path, cfg: AppConfig, landmarker=None, ts_offset_ms: float = 0.0) -> Record:
+def _record_from_row(row: dict) -> Record:
+    return Record(
+        id=int(row["id"]),
+        path=row["path"],
+        name=row["name"],
+        duration=float(row["duration"] or 0),
+        width=int(row["width"] or 0),
+        height=int(row["height"] or 0),
+        fps=float(row["fps"] or 0),
+        has_audio=bool(row["has_audio"]),
+        status=row["status"] or "pending",
+        error=row["error"] or "",
+        cache=row["cache_dir"] or "",
+    )
+
+
+def index_video(
+    path: Path,
+    cfg: AppConfig,
+    store: Store,
+    landmarker=None,
+    ts_offset_ms: float = 0.0,
+) -> Record:
     cdir = _cache_dir(cfg, path.stem)
-    rec = Record(path=str(path), name=path.name, cache=str(cdir))
     info = ffmpeg.probe(path)
-    rec.duration = info["duration"]
-    rec.width, rec.height, rec.fps = info["width"], info["height"], info["fps"]
-    rec.has_audio = info["has_audio"]
+    vid = store.upsert_video(
+        path=str(path), name=path.name, duration=info["duration"],
+        width=info["width"], height=info["height"], fps=info["fps"],
+        has_audio=int(bool(info["has_audio"])), cache_dir=str(cdir), status="pending",
+    )
+    rec = Record(
+        id=vid, path=str(path), name=path.name, duration=info["duration"],
+        width=info["width"], height=info["height"], fps=info["fps"],
+        has_audio=bool(info["has_audio"]), cache=str(cdir),
+    )
 
     try:
         # 1) 切片段（留档，便于人工核对与后续调参）
@@ -76,7 +110,7 @@ def index_video(path: Path, cfg: AppConfig, landmarker=None, ts_offset_ms: float
         if not clip.exists():
             ffmpeg.cut_clip(path, clip, cfg.clip.start, cfg.clip.duration, cfg.clip.reencode)
 
-        # 2) 音频特征
+        # 2) 音频特征（chroma 存进库）
         wav = cdir / "audio.wav"
         if not wav.exists():
             ffmpeg.extract_audio(clip, wav, sample_rate=cfg.audio.sample_rate)
@@ -84,11 +118,17 @@ def index_video(path: Path, cfg: AppConfig, landmarker=None, ts_offset_ms: float
             str(wav), sr=cfg.audio.sample_rate, hop_length=cfg.audio.hop_length,
             match_fps=cfg.audio.match_fps, max_lag_sec=cfg.audio.max_lag_sec,
         )
-        np.savez_compressed(
-            cdir / "audio.npz",
-            chroma=afeat["chroma"], chroma_full=afeat["chroma_full"],
-            tempo=np.array(afeat["tempo"]), duration=np.array(afeat["duration"]),
-            fps=np.array(afeat["fps"]), max_lag=np.array(afeat["max_lag"]),
+        store.set_audio(
+            vid,
+            {
+                "chroma": afeat["chroma"],
+                "chroma_full": afeat["chroma_full"],
+                "tempo": np.array(afeat["tempo"]),
+                "duration": np.array(afeat["duration"]),
+                "fps": np.array(afeat["fps"]),
+                "max_lag": np.array(afeat["max_lag"]),
+            },
+            tempo=afeat["tempo"],
         )
 
         # 3) 骨架特征
@@ -114,31 +154,24 @@ def index_video(path: Path, cfg: AppConfig, landmarker=None, ts_offset_ms: float
             rec.status = "no_pose"
             rec.error = f"人体检测不稳定（present={present_ratio:.0%}, frames={feat.shape[0]}）"
         else:
-            np.savez_compressed(cdir / "motion.npz", feat=feat, feat_mirror=feat_mirror,
-                                fps=np.array(cfg.pose.target_fps),
-                                present_ratio=np.array(present_ratio),
-                                shots=np.array(seq.shots, dtype=np.float32).reshape(-1, 2))
+            store.set_motion(
+                vid,
+                {
+                    "feat": feat,
+                    "feat_mirror": feat_mirror,
+                    "fps": np.array(cfg.pose.target_fps),
+                    "present_ratio": np.array(present_ratio),
+                    "shots": np.array(seq.shots, dtype=np.float32).reshape(-1, 2),
+                },
+                present_ratio=present_ratio,
+            )
             rec.status = "ok"
     except Exception as exc:  # 单个失败不拖垮整批
         rec.status = "error"
         rec.error = f"{type(exc).__name__}: {exc}"
+
+    store.set_status(vid, rec.status, rec.error)
     return rec
-
-
-def load_records(cfg: AppConfig) -> dict[str, Record]:
-    p = Path(cfg.cache_dir) / "records.json"
-    if not p.exists():
-        return {}
-    raw = json.loads(p.read_text(encoding="utf-8"))
-    return {k: Record(**v) for k, v in raw.items()}
-
-
-def save_records(cfg: AppConfig, records: list[Record]) -> None:
-    Path(cfg.cache_dir).mkdir(parents=True, exist_ok=True)
-    data = {r.path: asdict(r) for r in records}
-    (Path(cfg.cache_dir) / "records.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
 
 
 def _close_async(landmarker) -> None:
@@ -156,15 +189,15 @@ def _close_async(landmarker) -> None:
 
 def index_all(data_dir: str | Path, cfg: AppConfig, progress=None) -> list[Record]:
     videos = list_videos(data_dir)
-    cache = load_records(cfg)
+    store = Store(db_path(cfg))
     records: list[Record] = []
     landmarker = None
     ts_offset = 0.0
     try:
         for i, video in enumerate(videos, 1):
-            old = cache.get(str(video))
-            if old and old.status in ("ok", "no_pose") and (Path(old.cache) / "pose.npz").exists():
-                records.append(old)
+            row = store.get_by_path(str(video))
+            if row and row["status"] in ("ok", "no_pose"):
+                records.append(_record_from_row(row))
                 if progress:
                     progress(i, len(videos), video.name, "cached")
                 continue
@@ -178,47 +211,14 @@ def index_all(data_dir: str | Path, cfg: AppConfig, progress=None) -> list[Recor
                     min_presence_confidence=cfg.pose.min_presence_confidence,
                     min_tracking_confidence=cfg.pose.min_tracking_confidence,
                 )
-            rec = index_video(video, cfg, landmarker=landmarker, ts_offset_ms=ts_offset)
+            rec = index_video(video, cfg, store, landmarker=landmarker, ts_offset_ms=ts_offset)
             records.append(rec)
             ts_offset += (rec.duration + 1.0) * 1000.0
-            save_records(cfg, records)
     finally:
         if landmarker is not None:
             _close_async(landmarker)
-    save_records(cfg, records)
+        store.close()
     return records
-
-
-def _load_audio(rec: Record) -> dict | None:
-    p = Path(rec.cache) / "audio.npz"
-    if not p.exists():
-        return None
-    d = np.load(p)
-    return {k: (d[k].item() if d[k].ndim == 0 else d[k]) for k in d.files}
-
-
-def _load_motion(rec: Record) -> dict:
-    p = Path(rec.cache) / "motion.npz"
-    if not p.exists():
-        return {}
-    d = np.load(p)
-    return {k: d[k] for k in d.files}
-
-
-def build_music_matrix(records: list[Record], cfg: AppConfig) -> np.ndarray:
-    feats = [_load_audio(r) for r in records]
-    n = len(feats)
-    sim = np.eye(n, dtype=np.float32)
-    for i in range(n):
-        if feats[i] is None:
-            continue
-        for j in range(i + 1, n):
-            if feats[j] is None:
-                continue
-            s = audio.similarity(feats[i]["chroma"], feats[j]["chroma"],
-                                 max_lag=int(feats[i]["max_lag"]))
-            sim[i, j] = sim[j, i] = s
-    return sim
 
 
 def fold_tempo(t: float) -> float:
@@ -232,39 +232,7 @@ def fold_tempo(t: float) -> float:
     return t
 
 
-def build_dance_matrix(
-    records: list[Record],
-    music_labels: np.ndarray,
-    cfg: AppConfig,
-) -> np.ndarray:
-    motions = [_load_motion(r) for r in records]
-    tempos = np.array(
-        [(_load_audio(r) or {}).get("tempo", 0.0) for r in records], dtype=np.float32
-    )
-    n = len(records)
-    D = np.full((n, n), np.inf, dtype=np.float32)
-    np.fill_diagonal(D, 0.0)
-
-    for i in range(n):
-        if "feat" not in motions[i]:
-            continue
-        for j in range(i + 1, n):
-            if music_labels[i] != music_labels[j]:
-                continue  # 只在同一首 BGM 内比动作
-            if "feat" not in motions[j]:
-                continue
-            if _tempo_conflict(tempos[i], tempos[j], cfg):
-                continue
-            d = dtw.distance(
-                motions[i]["feat"], motions[j]["feat"], motions[j]["feat_mirror"],
-                window_ratio=cfg.match.dtw_window_ratio,
-                mirror_invariant=cfg.match.mirror_invariant,
-            )
-            D[i, j] = D[j, i] = d
-    return D
-
-
-def _tempo_conflict(ta: float, tb: float, cfg: AppConfig, tol: float = 0.06) -> bool:
+def _tempo_conflict(ta: float, tb: float, tol: float = 0.06) -> bool:
     """BPM 相差超过 tol 视为「加速/减速版」，不参与同组。"""
     fa, fb = fold_tempo(ta), fold_tempo(tb)
     if fa <= 0 or fb <= 0:
@@ -273,26 +241,84 @@ def _tempo_conflict(ta: float, tb: float, cfg: AppConfig, tol: float = 0.06) -> 
 
 
 def group(records: list[Record], cfg: AppConfig) -> Result:
-    music_sim = build_music_matrix(records, cfg)
-    music_dist = 1.0 - music_sim
-    music_labels = clustering.cluster_from_distances(
-        music_dist, threshold=1.0 - cfg.match.music_threshold
-    )
+    store = Store(db_path(cfg))
+    try:
+        rows = [store.get_by_path(r.path) for r in records]
+        audios = [store.audio_features(row) if row and row.get("audio_npz") else None for row in rows]
+        motions = [store.motion_features(row) if row and row.get("motion_npz") else {} for row in rows]
+        tempos = np.array(
+            [float(a["tempo"]) if a else 0.0 for a in audios], dtype=np.float32
+        )
 
-    dance_dist = build_dance_matrix(records, music_labels, cfg)
-    dance_labels = _cluster_per_group(dance_dist, music_labels, cfg.match.dance_threshold)
-    conf = _confidence(dance_dist, dance_labels)
-    return Result(
-        records=records,
-        music_sim=music_sim,
-        music_labels=music_labels,
-        dance_dist=dance_dist,
-        dance_labels=dance_labels,
-        tempo=np.array(
-            [(_load_audio(r) or {}).get("tempo", 0.0) for r in records], dtype=np.float32
-        ),
-        confidence=conf,
-    )
+        music_sim = _music_matrix(audios)
+        music_labels = clustering.cluster_from_distances(
+            1.0 - music_sim, threshold=1.0 - cfg.match.music_threshold
+        )
+        dance_dist = _dance_matrix(motions, tempos, music_labels, cfg)
+        dance_labels = _cluster_per_group(dance_dist, music_labels, cfg.match.dance_threshold)
+        conf = _confidence(dance_dist, dance_labels)
+
+        store.set_groups([
+            (records[i].id, int(music_labels[i]), int(dance_labels[i]), float(conf[i]))
+            for i in range(len(records))
+        ])
+        return Result(
+            records=records,
+            music_sim=music_sim,
+            music_labels=music_labels,
+            dance_dist=dance_dist,
+            dance_labels=dance_labels,
+            tempo=tempos,
+            confidence=conf,
+            db_path=str(db_path(cfg)),
+        )
+    finally:
+        store.close()
+
+
+def _music_matrix(audios: list[dict | None]) -> np.ndarray:
+    n = len(audios)
+    sim = np.eye(n, dtype=np.float32)
+    for i in range(n):
+        if audios[i] is None:
+            continue
+        for j in range(i + 1, n):
+            if audios[j] is None:
+                continue
+            s = audio.similarity(
+                audios[i]["chroma"], audios[j]["chroma"],
+                max_lag=int(audios[i]["max_lag"]),
+            )
+            sim[i, j] = sim[j, i] = s
+    return sim
+
+
+def _dance_matrix(
+    motions: list[dict],
+    tempos: np.ndarray,
+    music_labels: np.ndarray,
+    cfg: AppConfig,
+) -> np.ndarray:
+    n = len(motions)
+    D = np.full((n, n), np.inf, dtype=np.float32)
+    np.fill_diagonal(D, 0.0)
+    for i in range(n):
+        if "feat" not in motions[i]:
+            continue
+        for j in range(i + 1, n):
+            if music_labels[i] != music_labels[j]:
+                continue  # 只在同一首 BGM 内比动作
+            if "feat" not in motions[j]:
+                continue
+            if _tempo_conflict(tempos[i], tempos[j]):
+                continue
+            d = dtw.distance(
+                motions[i]["feat"], motions[j]["feat"], motions[j]["feat_mirror"],
+                window_ratio=cfg.match.dtw_window_ratio,
+                mirror_invariant=cfg.match.mirror_invariant,
+            )
+            D[i, j] = D[j, i] = d
+    return D
 
 
 def _cluster_per_group(D: np.ndarray, music_labels: np.ndarray, threshold: float) -> np.ndarray:
@@ -327,6 +353,10 @@ def export(result: Result, out_dir: str | Path, copy_files: bool = False) -> Pat
             f'{result.confidence[i]:.2f},{result.tempo[i]:.1f},{r.status}'
         )
     (out / "分组结果.csv").write_text("\n".join(lines), encoding="utf-8")
+
+    # 把 SQLite 数据库也拷一份到输出目录，数据和结果一起走
+    if result.db_path and Path(result.db_path).exists():
+        shutil.copy2(result.db_path, out / "分组数据.db")
 
     for i, r in enumerate(result.records):
         target = out / f"M{result.music_labels[i]}" / f"D{result.dance_labels[i]}"

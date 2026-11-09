@@ -40,11 +40,24 @@ python -m dancecluster.cli index --data ./data      # 只提特征
 python -m dancecluster.cli group --data ./data      # 用缓存分组
 ```
 
+## 数据存储（SQLite）
+
+所有结果落在一个文件里：`<输出目录>/_cache/dancecluster.db`（导出时另复制一份为 `分组数据.db`）。
+
+- **videos** 表：路径、时长、分辨率、状态、BPM、音乐组/动作组、置信度、特征 BLOB
+- **runs** 表：每次运行的参数与输出目录
+- 断点续跑只查这张表，不用重新扫文件
+
+```bash
+sqlite3 _cache/dancecluster.db "select name, music_group, dance_group, confidence from videos"
+```
+
 ## 输出
 
 ```
 output/
 ├── 分组结果.csv          # 文件、音乐组、动作组、置信度、BPM、状态
+├── 分组数据.db           # SQLite 数据库副本（特征 + 分组结果）
 ├── M1/
 │   ├── D1/ *.mp4
 │   └── D2/ *.mp4
