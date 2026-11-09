@@ -96,7 +96,7 @@ def index_video(
     vid = store.upsert_video(
         path=str(path), name=path.name, duration=info["duration"],
         width=info["width"], height=info["height"], fps=info["fps"],
-        has_audio=int(bool(info["has_audio"])), cache_dir=str(cdir), status="pending",
+        has_audio=int(bool(info["has_audio"])), cache_dir=str(cdir), status="extracting",
     )
     rec = Record(
         id=vid, path=str(path), name=path.name, duration=info["duration"],
@@ -108,16 +108,26 @@ def index_video(
         # 1) 切片段（留档，便于人工核对与后续调参）
         clip = cdir / "clip.mp4"
         if not clip.exists():
-            ffmpeg.cut_clip(path, clip, cfg.clip.start, cfg.clip.duration, cfg.clip.reencode)
+            ffmpeg.cut_clip(path, clip, cfg.clip.start, cfg.clip.duration, cfg.clip.reencode, max_height=cfg.clip.max_height)
 
-        # 2) 音频特征（chroma 存进库）
+        # 2) 音频（从原视频抽，长度独立于骨架片段）
         wav = cdir / "audio.wav"
         if not wav.exists():
-            ffmpeg.extract_audio(clip, wav, sample_rate=cfg.audio.sample_rate)
+            adur = cfg.clip.audio_duration if cfg.clip.audio_duration > 0 else None
+            ffmpeg.extract_audio(path, wav, start=0.0, duration=adur, sample_rate=cfg.audio.sample_rate)
         afeat = audio.feature_from_audio(
             str(wav), sr=cfg.audio.sample_rate, hop_length=cfg.audio.hop_length,
             match_fps=cfg.audio.match_fps, max_lag_sec=cfg.audio.max_lag_sec,
         )
+        fp = audio.fingerprint(str(wav))
+        # 音频特征已入库，wav 只留给预览 → 压成 AAC 省空间
+        m4a = cdir / "audio.m4a"
+        if not m4a.exists():
+            try:
+                ffmpeg.to_aac(wav, m4a, bitrate="96k")
+                wav.unlink(missing_ok=True)
+            except Exception:
+                pass
         store.set_audio(
             vid,
             {
@@ -127,6 +137,7 @@ def index_video(
                 "duration": np.array(afeat["duration"]),
                 "fps": np.array(afeat["fps"]),
                 "max_lag": np.array(afeat["max_lag"]),
+                "fingerprint": fp if fp is not None else np.zeros((0, 32), dtype=np.uint8),
             },
             tempo=afeat["tempo"],
         )
@@ -187,22 +198,79 @@ def _close_async(landmarker) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-def index_all(data_dir: str | Path, cfg: AppConfig, progress=None) -> list[Record]:
-    videos = list_videos(data_dir)
+def _discover(folders: list, cfg: AppConfig, store: Store) -> dict:
+    """把文件夹里的视频登记为 pending（只登记，不提取）。返回统计。"""
+    stats = {"scanned": 0, "added": 0, "already": 0}
+    for folder in folders:
+        for p in list_videos(folder):
+            stats["scanned"] += 1
+            row = store.get_by_path(str(p))
+            if row is None:
+                info = ffmpeg.probe(p)
+                store.upsert_video(
+                    path=str(p), name=p.name, duration=info["duration"],
+                    width=info["width"], height=info["height"], fps=info["fps"],
+                    has_audio=int(bool(info["has_audio"])),
+                    cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
+                )
+                stats["added"] += 1
+            elif row["status"] in ("ok", "no_pose"):
+                stats["already"] += 1
+    return stats
+
+
+def register_folder(folder: str | Path, cfg: AppConfig) -> dict:
+    """扫描文件夹、把视频登记为待提取任务（不保存文件夹本身）。"""
+    store = Store(db_path(cfg))
+    try:
+        return _discover([str(Path(folder).resolve())], cfg, store)
+    finally:
+        store.close()
+
+
+def register_videos(paths: list, cfg: AppConfig) -> dict:
+    store = Store(db_path(cfg))
+    stats = {"scanned": 0, "added": 0, "already": 0}
+    try:
+        for p in paths:
+            p = Path(p)
+            if p.suffix.lower() not in VIDEO_EXTS:
+                continue
+            stats["scanned"] += 1
+            row = store.get_by_path(str(p))
+            if row is None:
+                info = ffmpeg.probe(p)
+                store.upsert_video(
+                    path=str(p), name=p.name, duration=info["duration"],
+                    width=info["width"], height=info["height"], fps=info["fps"],
+                    has_audio=int(bool(info["has_audio"])),
+                    cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
+                )
+                stats["added"] += 1
+            elif row["status"] in ("ok", "no_pose"):
+                stats["already"] += 1
+        return stats
+    finally:
+        store.close()
+
+
+def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None) -> list[Record]:
+    """处理待提取（pending/error）的视频；only_ids 指定只处理选中的。"""
     store = Store(db_path(cfg))
     records: list[Record] = []
     landmarker = None
     ts_offset = 0.0
     try:
-        for i, video in enumerate(videos, 1):
-            row = store.get_by_path(str(video))
-            if row and row["status"] in ("ok", "no_pose"):
-                records.append(_record_from_row(row))
-                if progress:
-                    progress(i, len(videos), video.name, "cached")
-                continue
+        store.reset_stale_extracting()
+        pending = [r for r in store.all_videos() if r["status"] in ("pending", "error")]
+        if only_ids is not None:
+            idset = set(int(x) for x in only_ids)
+            pending = [r for r in pending if int(r["id"]) in idset]
+        total = len(pending)
+        for i, row in enumerate(pending, 1):
+            video = Path(row["path"])
             if progress:
-                progress(i, len(videos), video.name, "extracting")
+                progress(i, total, video.name, "extracting")
             if landmarker is None:
                 landmarker = pose.create_landmarker(
                     cfg.pose.model_path,
@@ -214,11 +282,52 @@ def index_all(data_dir: str | Path, cfg: AppConfig, progress=None) -> list[Recor
             rec = index_video(video, cfg, store, landmarker=landmarker, ts_offset_ms=ts_offset)
             records.append(rec)
             ts_offset += (rec.duration + 1.0) * 1000.0
+        done_ids = {r.id for r in records}
+        for r in store.all_videos():
+            if r["id"] not in done_ids and r["status"] in ("ok", "no_pose"):
+                records.append(_record_from_row(r))
     finally:
         if landmarker is not None:
             _close_async(landmarker)
         store.close()
     return records
+
+
+def index_all(data_dir: str | Path | list, cfg: AppConfig, progress=None) -> list[Record]:
+    """命令行用：扫描文件夹 → 登记 → 处理待提取。"""
+    folders = [data_dir] if isinstance(data_dir, (str, Path)) else list(data_dir)
+    store = Store(db_path(cfg))
+    try:
+        store.reset_stale_extracting()
+        _discover(folders, cfg, store)
+    finally:
+        store.close()
+    return process_pending(cfg, progress)
+
+
+def clear_all(cfg: AppConfig) -> None:
+    """清空缓存目录下所有数据（数据库 + 每个视频的中间文件 + 缩略图）。保留缓存目录本身。"""
+    import shutil
+
+    base = Path(cfg.cache_dir)
+    if base.exists():
+        for item in base.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def all_records(cfg: AppConfig) -> list[Record]:
+    """从库里取出全部已索引视频（不限于某个文件夹）。"""
+    store = Store(db_path(cfg))
+    try:
+        return [_record_from_row(r) for r in store.all_videos()]
+    finally:
+        store.close()
 
 
 def fold_tempo(t: float) -> float:
@@ -246,6 +355,17 @@ def group(records: list[Record], cfg: AppConfig) -> Result:
         rows = [store.get_by_path(r.path) for r in records]
         audios = [store.audio_features(row) if row and row.get("audio_npz") else None for row in rows]
         motions = [store.motion_features(row) if row and row.get("motion_npz") else {} for row in rows]
+
+        # 老缓存没有指纹 → 从 audio.wav 现场补算
+        for i, r in enumerate(records):
+            a = audios[i]
+            if a is None:
+                continue
+            fp = a.get("fingerprint")
+            if fp is None or (hasattr(fp, "shape") and fp.shape[0] == 0):
+                wav = Path(r.cache) / "audio.wav"
+                if wav.exists():
+                    a["fingerprint"] = audio.fingerprint(str(wav))
         tempos = np.array(
             [float(a["tempo"]) if a else 0.0 for a in audios], dtype=np.float32
         )
@@ -258,10 +378,19 @@ def group(records: list[Record], cfg: AppConfig) -> Result:
         dance_labels = _cluster_per_group(dance_dist, music_labels, cfg.match.dance_threshold)
         conf = _confidence(dance_dist, dance_labels)
 
+        # 没有动作特征（未检测到骨架）的视频不参与动作分组
+        has_motion = np.array(["feat" in m for m in motions], dtype=bool)
+        dance_labels = np.where(has_motion, dance_labels, 0)
+        conf = np.where(has_motion, conf, 0.0)
+
         store.set_groups([
-            (records[i].id, int(music_labels[i]), int(dance_labels[i]), float(conf[i]))
+            (records[i].id, int(music_labels[i]),
+             int(dance_labels[i]) if dance_labels[i] > 0 else None,
+             float(conf[i]) if dance_labels[i] > 0 else None)
             for i in range(len(records))
         ])
+        store.ensure_groups("music", set(int(x) for x in music_labels))
+        store.ensure_groups("dance", set(int(x) for x in dance_labels if x > 0))
         return Result(
             records=records,
             music_sim=music_sim,
@@ -285,11 +414,7 @@ def _music_matrix(audios: list[dict | None]) -> np.ndarray:
         for j in range(i + 1, n):
             if audios[j] is None:
                 continue
-            s = audio.similarity(
-                audios[i]["chroma"], audios[j]["chroma"],
-                max_lag=int(audios[i]["max_lag"]),
-            )
-            sim[i, j] = sim[j, i] = s
+            sim[i, j] = sim[j, i] = audio.music_similarity(audios[i], audios[j])
     return sim
 
 

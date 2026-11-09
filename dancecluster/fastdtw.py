@@ -14,16 +14,26 @@ INF = 1e12
 
 @njit(cache=True, fastmath=True)
 def _dtw_banded(a: np.ndarray, b: np.ndarray, w: int) -> float:
-    """Sakoe-Chiba 带约束 DTW，返回累计距离（未归一化）。"""
+    """相对 Sakoe-Chiba 带约束 DTW，返回累计距离（未归一化）。
+
+    用「比例中心」而非对角中心：a 的第 i 帧对应 b 的第 i*n/m 帧附近，
+    这样两段长度不同时带宽仍能连通到终点，不会被切断成 INF。
+    """
     n, m = a.shape[0], b.shape[0]
     prev = np.full(m + 2, INF)
     cur = np.full(m + 2, INF)
     prev[1] = 0.0
+    scale = n / m
     for i in range(1, n + 1):
         for j in range(m + 2):
             cur[j] = INF
-        lo = max(1, i - w)
-        hi = min(m, i + w)
+        center = i / scale
+        lo = int(center - w)
+        if lo < 1:
+            lo = 1
+        hi = int(center + w)
+        if hi > m:
+            hi = m
         for j in range(lo, hi + 1):
             d = 0.0
             for k in range(a.shape[1]):

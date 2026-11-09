@@ -3,10 +3,51 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def app_data_dir() -> Path:
+    """应用级配置目录（跨重启记住 cache 目录等设置）。
+
+    正常双击运行：Windows → %APPDATA%/DanceCluster，macOS → ~/Library/Application Support/DanceCluster。
+    开发/测试可用环境变量 DANCECLUSTER_CONFIG_DIR 指到别处。
+    """
+    env = os.environ.get("DANCECLUSTER_CONFIG_DIR")
+    if env:
+        return Path(env)
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return base / "DanceCluster"
+
+
+def settings_path() -> Path:
+    return app_data_dir() / "config.json"
+
+
+def load_settings() -> dict:
+    p = settings_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_settings(data: dict) -> Path:
+    p = settings_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
 
 
 @dataclass
@@ -15,6 +56,10 @@ class ClipConfig:
 
     start: float = 0.0
     duration: float = 20.0
+    # 音频片段长度（秒）。音频比骨架便宜，可取更长；0 = 整段
+    audio_duration: float = 60.0
+    # 截取片段的最大高度（像素）。超过就重编码缩到该高度，省空间（4K→720p）
+    max_height: int = 720
     # False = 流拷贝（秒切，但有 keyframe 误差）；True = 重编码（精确，慢）
     reencode: bool = False
 
@@ -46,7 +91,7 @@ class MatchConfig:
     # DTW 速度约束：允许的时间弯曲比例（0.08 = ±8%）
     dtw_window_ratio: float = 0.08
     # 音乐相似度阈值（0~1，越高越严格）
-    music_threshold: float = 0.55
+    music_threshold: float = 0.60
     # 动作相似度阈值（0~1，越高越严格）
     dance_threshold: float = 0.35
     mirror_invariant: bool = True     # 镜像视为同一支舞

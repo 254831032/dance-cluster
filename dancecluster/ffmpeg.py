@@ -81,16 +81,30 @@ def cut_clip(
     start: float = 0.0,
     duration: float = 20.0,
     reencode: bool = False,
+    max_height: int = 0,
 ) -> Path:
-    """切出 [start, start+duration) 片段。默认流拷贝，速度快。"""
+    """切出 [start, start+duration) 片段。
+
+    默认流拷贝（快）。若 max_height>0 且源视频更高，则重编码并缩到该高度
+    （4K→720p 省大量空间，骨架识别用不到 4K）。
+    """
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if reencode:
+    need_scale = False
+    if max_height > 0:
+        info = probe(video)
+        need_scale = info["height"] > max_height
+
+    if reencode or need_scale:
         cmd = [
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(video), "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k", str(out),
+            "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
+        ]
+        if need_scale:
+            cmd += ["-vf", f"scale=-2:{max_height}"]
+        cmd += [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", str(out),
         ]
     else:
         cmd = [
@@ -145,3 +159,55 @@ def pitch_shift(
         ]
     )
     return out
+
+
+def extract_thumbnail(
+    video: str | Path,
+    out: str | Path,
+    at: float = 1.0,
+    width: int = 320,
+) -> Path:
+    """抽一帧当缩略图。at 秒处取帧，等比缩到 width 宽，存 JPEG。"""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{at:.2f}", "-i", str(video),
+        "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "3", str(out),
+    ]
+    _run(cmd)
+    return out
+
+
+def extract_gif(
+    video: str | Path,
+    out: str | Path,
+    at: float = 1.0,
+    duration: float = 2.0,
+    fps: int = 5,
+    width: int = 240,
+) -> Path:
+    """抽一小段做成循环 GIF 动图缩略图（低帧率低画质，省空间）。"""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    vf = (
+        f"fps={int(fps)},scale={int(width)}:-2:flags=lanczos,"
+        "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+    )
+    cmd = [
+        ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{at:.2f}", "-t", f"{duration:.2f}", "-i", str(video),
+        "-vf", vf, "-loop", "0", str(out),
+    ]
+    _run(cmd)
+    return out
+
+def to_aac(src: str | Path, dst: str | Path, bitrate: str = "96k") -> Path:
+    """把音频压成 AAC（预览用），比 WAV 小约 5 倍。"""
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _run([
+        ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(src), "-vn", "-c:a", "aac", "-b:a", bitrate, str(dst),
+    ])
+    return dst

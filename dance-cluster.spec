@@ -39,7 +39,7 @@ datas += collect_data_files("webview", includes=["js/*.js", "js/lib/*.js"])
 hiddenimports_webview = ["webview", "bottle", "proxy_tools"]
 if sys.platform == "win32":
     hiddenimports_webview += ["webview.platforms.winforms", "webview.platforms.edgechromium"]
-    for pkg in ("pythonnet", "clr_loader"):
+    for pkg in ("pythonnet", "clr_loader", "pystray"):
         try:
             d, b, h = collect_all(pkg)
             datas += d

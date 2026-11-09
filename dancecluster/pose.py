@@ -22,6 +22,15 @@ import mediapipe as mp  # noqa: E402
 
 NUM_LANDMARKS = 33
 
+# MediaPipe Pose 骨架连线（用于叠加渲染）
+POSE_CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24), (23, 25), (25, 27),
+    (24, 26), (26, 28), (15, 17), (16, 18), (17, 19),
+    (18, 20), (27, 29), (28, 30), (29, 31), (30, 32),
+    (0, 1), (1, 2), (2, 3), (0, 4), (4, 5), (5, 6),
+]
+
 # MediaPipe 的左右对称点对（用于镜像）
 MIRROR_PAIRS = [
     (1, 4), (2, 5), (3, 6),          # 眼
@@ -49,6 +58,7 @@ class PoseSequence:
     fps: float                 # 实际采样帧率
     shots: list[tuple[float, float]]  # 镜头段（秒）
     person_score: np.ndarray   # (F,) 被选主舞者的得分，便于排查
+    landmarks2d: np.ndarray = None  # (F, 33, 2) 归一化 2D 关键点（叠加渲染用）
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -61,6 +71,7 @@ class PoseSequence:
             fps=np.array(self.fps, dtype=np.float32),
             shots=np.array(self.shots, dtype=np.float32).reshape(-1, 2),
             person_score=self.person_score.astype(np.float32),
+            landmarks2d=self.landmarks2d.astype(np.float32) if self.landmarks2d is not None else np.zeros((0, 33, 2), dtype=np.float32),
         )
 
     @classmethod
@@ -74,6 +85,7 @@ class PoseSequence:
             fps=float(d["fps"]),
             shots=shots,
             person_score=d["person_score"],
+            landmarks2d=d["landmarks2d"] if d["landmarks2d"].size else None,
         )
 
 
@@ -201,7 +213,7 @@ def extract_pose(
     step = max(1, int(round(src_fps / analysis_fps)))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    worlds, viss, presents, scores = [], [], [], []
+    worlds, viss, presents, scores, l2ds = [], [], [], [], []
     shots: list[tuple[float, float]] = []
     shot_start = 0.0
     prev_gray = None
@@ -251,11 +263,13 @@ def extract_pose(
                 viss.append(vis_list[idx])
                 presents.append(True)
                 scores.append(1.0)
+                l2ds.append(norm_pts[idx][:, :2])
             else:
                 worlds.append(np.zeros((NUM_LANDMARKS, 3), dtype=np.float32))
                 viss.append(np.zeros(NUM_LANDMARKS, dtype=np.float32))
                 presents.append(False)
                 scores.append(0.0)
+                l2ds.append(np.zeros((NUM_LANDMARKS, 2), dtype=np.float32))
 
             out_idx += 1
             frame_idx += 1
@@ -269,6 +283,7 @@ def extract_pose(
     vis = np.stack(viss) if viss else np.zeros((0, NUM_LANDMARKS), np.float32)
     present = np.array(presents, dtype=bool)
     score = np.array(scores, dtype=np.float32)
+    l2d = np.stack(l2ds) if l2ds else np.zeros((0, NUM_LANDMARKS, 2), np.float32)
 
     if world.shape[0] >= 3:
         smooth = _smooth(world, smooth_window)
@@ -281,4 +296,112 @@ def extract_pose(
         fps=float(src_fps / step),
         shots=shots,
         person_score=score,
+        landmarks2d=l2d.astype(np.float32),
     )
+
+
+# ---------------------------------------------------------------------------
+# 骨架叠加渲染：在原画面上画出识别到的关键点 + 连线，输出 GIF / 静态图
+# ---------------------------------------------------------------------------
+def _draw_skeleton(frame, pts, vis, w, h):
+    px = (np.asarray(pts)[:, 0] * w).astype(np.int32)
+    py = (np.asarray(pts)[:, 1] * h).astype(np.int32)
+    ok = np.asarray(vis) > 0.3
+    for a, b in POSE_CONNECTIONS:
+        if ok[a] and ok[b]:
+            cv2.line(frame, (px[a], py[a]), (px[b], py[b]), (0, 255, 0), 2)
+    for i in range(NUM_LANDMARKS):
+        if ok[i]:
+            cv2.circle(frame, (px[i], py[i]), 2, (0, 255, 0), -1)
+    return frame
+
+
+def render_skeleton_gif(pose_path, out_gif, fps=6, max_seconds=8, width=320, aspect=0.75):
+    """把骨架（仅关键点数据）渲染成黑底循环 GIF。不依赖视频片段。"""
+    from PIL import Image
+
+    seq = PoseSequence.load(pose_path)
+    l2d = seq.landmarks2d
+    if l2d is None or len(l2d) < 2:
+        return None
+    h = max(1, int(round(width / aspect))) if aspect > 0 else int(width * 0.75)
+    step = max(1, int(round(seq.fps / fps)))
+    frames = []
+    for k in range(0, len(l2d), step):
+        vis = seq.visibility[k] if k < len(seq.visibility) else np.ones(NUM_LANDMARKS)
+        canvas = np.zeros((h, width, 3), np.uint8)
+        _draw_skeleton(canvas, l2d[k], vis, width, h)
+        frames.append(Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)))
+        if len(frames) >= max_seconds * fps:
+            break
+    if len(frames) < 2:
+        return None
+    out_gif = Path(out_gif)
+    out_gif.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(out_gif, save_all=True, append_images=frames[1:],
+                   duration=int(1000 / fps), loop=0, optimize=True)
+    return out_gif
+
+
+def render_skeleton_frame(pose_path, out_img, width=320, aspect=0.75):
+    """渲染单帧骨架图（黑底静态）。不依赖视频片段。"""
+    from PIL import Image
+
+    seq = PoseSequence.load(pose_path)
+    l2d = seq.landmarks2d
+    if l2d is None or len(l2d) < 1:
+        return None
+    h = max(1, int(round(width / aspect))) if aspect > 0 else int(width * 0.75)
+    k = len(l2d) // 2
+    vis = seq.visibility[k] if k < len(seq.visibility) else np.ones(NUM_LANDMARKS)
+    canvas = np.zeros((h, width, 3), np.uint8)
+    _draw_skeleton(canvas, l2d[k], vis, width, h)
+    img = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+    out_img = Path(out_img)
+    out_img.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_img)
+    return out_img
+
+
+def render_preview_video(pose_path, audio_path, out_mp4, fps=6, width=320, aspect=0.75, max_seconds=12):
+    """骨架动作 + 音频，合成一条带声音的预览视频（mp4）。失败返回 None。"""
+    import shutil
+    import subprocess
+    import tempfile
+
+    from . import ffmpeg as _ffmpeg
+
+    seq = PoseSequence.load(pose_path)
+    l2d = seq.landmarks2d
+    if l2d is None or len(l2d) < 2:
+        return None
+    h = max(2, int(round(width / aspect))) if aspect > 0 else int(width * 0.75)
+    h -= h % 2  # libx264 要求偶数尺寸
+    step = max(1, int(round(seq.fps / fps)))
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        idx = 0
+        max_frames = int(max_seconds * fps)
+        for k in range(0, len(l2d), step):
+            vis = seq.visibility[k] if k < len(seq.visibility) else np.ones(NUM_LANDMARKS)
+            canvas = np.zeros((h, width, 3), np.uint8)
+            _draw_skeleton(canvas, l2d[k], vis, width, h)
+            cv2.imwrite(str(tmpdir / f"f{idx:04d}.png"), canvas)
+            idx += 1
+            if idx >= max_frames:
+                break
+        if idx < 2:
+            return None
+        out_mp4 = Path(out_mp4)
+        out_mp4.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            _ffmpeg.ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+            "-framerate", str(fps), "-i", str(tmpdir / "f%04d.png"),
+            "-i", str(audio_path),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "96k", "-shortest", str(out_mp4),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return out_mp4
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
