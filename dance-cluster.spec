@@ -7,7 +7,9 @@
 """
 import os
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+import sys
+
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs
 
 datas = []
 binaries = []
@@ -32,6 +34,22 @@ binaries += collect_dynamic_libs("mediapipe")
 datas += collect_data_files("soundfile")
 binaries += collect_dynamic_libs("soundfile")
 
+# pywebview 的 JS 资源 + 平台后端
+datas += collect_data_files("webview", includes=["js/*.js", "js/lib/*.js"])
+hiddenimports_webview = ["webview", "bottle", "proxy_tools"]
+if sys.platform == "win32":
+    hiddenimports_webview += ["webview.platforms.winforms", "webview.platforms.edgechromium"]
+    for pkg in ("pythonnet", "clr_loader"):
+        try:
+            d, b, h = collect_all(pkg)
+            datas += d
+            binaries += b
+            hiddenimports_webview += h
+        except Exception:
+            pass
+elif sys.platform == "darwin":
+    hiddenimports_webview += ["webview.platforms.cocoa"]
+
 hiddenimports = [
     "mediapipe.tasks.python.vision",
     "mediapipe.tasks.python.core",
@@ -43,7 +61,7 @@ hiddenimports = [
     "flask",
     "jinja2",
     "werkzeug",
-]
+] + hiddenimports_webview
 
 a = Analysis(
     ["app.py"],

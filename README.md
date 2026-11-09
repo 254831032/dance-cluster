@@ -29,7 +29,8 @@ pip install -r requirements.txt
 # 准备 ffmpeg / ffprobe：放到 .tools/bin/ 或放进 PATH
 # 准备模型：models/pose_landmarker_heavy.task
 
-python -m dancecluster.gui       # 图形界面
+python -m dancecluster.desktop   # 原生窗口（pywebview）
+python -m dancecluster.webui     # 浏览器模式（备用）
 ```
 
 命令行：

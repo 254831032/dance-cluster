@@ -22,6 +22,7 @@ from .config import AppConfig
 app = Flask(__name__)
 
 _lock = threading.Lock()
+_ui = {"desktop": False, "window": None}
 _state: dict = {
     "running": False,
     "progress": 0,
@@ -161,6 +162,30 @@ def open_folder():
     return jsonify({"ok": False, "error": "目录不存在"}), 404
 
 
+@app.post("/api/pick_folder")
+def pick_folder():
+    win = _ui.get("window")
+    if not win:
+        return jsonify({"ok": False, "error": "浏览器模式不支持系统文件夹选择，请手动填写路径"}), 400
+    try:
+        import webview
+
+        kind = getattr(webview, "FileDialog", None)
+        dialog = kind.FOLDER if kind is not None else webview.FOLDER_DIALOG
+        result = win.create_file_dialog(dialog)
+    except Exception as exc:  # pragma: no cover - 依赖桌面环境
+        return jsonify({"ok": False, "error": f"打开选择框失败：{exc}"}), 500
+    if not result:
+        return jsonify({"ok": False, "error": "已取消"}), 400
+    path = result[0] if isinstance(result, (list, tuple)) else result
+    return jsonify({"ok": True, "path": str(path)})
+
+
+@app.get("/api/mode")
+def mode():
+    return jsonify({"desktop": bool(_ui["desktop"])})
+
+
 @app.post("/api/quit")
 def quit_app():
     import os
@@ -176,11 +201,11 @@ def _free_port(start: int = 8765) -> int:
     return start
 
 
-def main() -> int:
+def main(open_browser: bool = True) -> int:
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
     print(f"DanceCluster 已启动：{url}", flush=True)
-    if os.environ.get("DANCECLUSTER_NO_BROWSER") != "1":
+    if open_browser and os.environ.get("DANCECLUSTER_NO_BROWSER") != "1":
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     app.run(host="127.0.0.1", port=port, threaded=True, use_reloader=False)
     return 0
@@ -217,6 +242,9 @@ INDEX_HTML = """<!doctype html>
   tr.nopose td { color: var(--bad); }
   pre#log { background:#0c0e12; border:1px solid var(--line); border-radius:8px; padding:12px; height: 180px; overflow:auto; font-size:12px; color:#aab3c2; white-space: pre-wrap; }
   .muted { color: var(--dim); font-size: 12px; }
+  .inputrow { display: flex; gap: 8px; }
+  .inputrow input { flex: 1; }
+  .inputrow button { padding: 8px 12px; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -228,11 +256,11 @@ INDEX_HTML = """<!doctype html>
     <div class="grid2">
       <div>
         <label>视频目录</label>
-        <input id="data" type="text" placeholder="例如 D:\\videos 或 /Users/you/videos">
+        <div class="inputrow"><input id="data" type="text" placeholder="例如 D:\\videos 或 /Users/you/videos"><button class="ghost pick" data-target="data">选择…</button></div>
       </div>
       <div>
         <label>输出目录</label>
-        <input id="out" type="text" placeholder="例如 D:\\output">
+        <div class="inputrow"><input id="out" type="text" placeholder="例如 D:\\output"><button class="ghost pick" data-target="out">选择…</button></div>
       </div>
     </div>
     <div class="grid4" style="margin-top:14px">
@@ -247,6 +275,7 @@ INDEX_HTML = """<!doctype html>
       <button id="run">开始处理</button>
       <button id="cancel" class="ghost" disabled>取消</button>
       <button id="open" class="ghost" disabled>打开输出目录</button>
+      <button id="quit" class="ghost" style="display:none">退出程序</button>
     </div>
     <div class="bar"><i id="fill"></i></div>
     <div class="status" id="status">就绪</div>
@@ -354,9 +383,25 @@ function renderRows(rows) {
   $("#empty").style.display = "none";
 }
 
+document.querySelectorAll(".pick").forEach(btn => btn.addEventListener("click", async () => {
+  const r = await fetch("/api/pick_folder", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({which: btn.dataset.target})});
+  const j = await r.json();
+  if (j.ok) { const el = $("#" + btn.dataset.target); el.value = j.path; el.dispatchEvent(new Event("change")); }
+  else if (j.error && j.error !== "已取消") alert(j.error);
+}));
+
+fetch("/api/mode").then(r => r.json()).then(m => {
+  if (!m.desktop) {
+    document.querySelectorAll(".pick").forEach(b => b.style.display = "none");
+  } else {
+    $("#quit").style.display = "";
+  }
+});
+
 $("#run").addEventListener("click", start);
 $("#cancel").addEventListener("click", cancel);
 $("#open").addEventListener("click", openFolder);
+$("#quit").addEventListener("click", () => fetch("/api/quit", {method:"POST"}));
 poll();
 </script>
 </body>
