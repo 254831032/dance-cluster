@@ -329,6 +329,19 @@ def _run_job(params: dict) -> None:
 
 
 # ---------- 页面 ----------
+@app.get("/vendor/<path:name>")
+def vendor_file(name):
+    base = (Path(__file__).parent / "vendor").resolve()
+    p = (base / name).resolve()
+    try:
+        p.relative_to(base)
+    except Exception:
+        return ("", 404)
+    if not p.is_file():
+        return ("", 404)
+    return send_file(p)
+
+
 @app.get("/")
 def index():
     return INDEX_HTML
@@ -644,6 +657,37 @@ def pose_data(video_id):
         "landmarks": frames,
         "visibility": vis_out,
         "aspect": (row["width"] / row["height"]) if (row["width"] and row["height"]) else 0.75,
+    })
+
+
+@app.get("/api/pose3d/<int:video_id>")
+def pose3d_data(video_id):
+    row = _get_row(video_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    if not _ensure_cache(row):
+        return jsonify({"ok": False, "error": "缓存缺失"}), 404
+    npz = Path(row["cache_dir"]) / "pose.npz"
+    if not npz.exists():
+        return jsonify({"ok": False, "error": "无骨架数据"}), 404
+    import numpy as np
+
+    with np.load(npz) as d:
+        w = d["world"]
+        vis = d["visibility"] if "visibility" in d else np.zeros(w.shape[:2], np.float32)
+        fps = float(d["fps"]) if d["fps"] is not None and d["fps"].size else 15.0
+    F = int(w.shape[0])
+    step = max(1, F // 900)
+    w = w[::step]
+    vis = vis[::step]
+    frames = [[[round(float(x), 3), round(float(y), 3), round(float(z), 3)] for x, y, z in fr] for fr in w]
+    vis_out = [[round(float(v), 2) for v in fr] for fr in vis]
+    return jsonify({
+        "ok": True,
+        "fps": (fps / step) if step > 1 else fps,
+        "frames": len(frames),
+        "world": frames,
+        "visibility": vis_out,
     })
 
 
@@ -1137,6 +1181,12 @@ INDEX_HTML = r"""<!doctype html>
   .hover-btns button { padding:3px 9px; font-size:11px; border-radius:6px; background:rgba(30,36,48,.92); color:#fff; border:1px solid rgba(255,255,255,.16); cursor:pointer; line-height:1.4; }
   .hover-btns button:hover { background:var(--accent); border-color:var(--accent); }
   .skel-stage { position:relative; background:#000; border-radius:8px; overflow:hidden; margin:0 auto; }
+  .test-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:900px) { .test-grid { grid-template-columns:1fr; } }
+  .skel3d-stage { position:relative; height:420px; background:#0a0d12; border-radius:8px; overflow:hidden; cursor:grab; }
+  .skel3d-stage:active { cursor:grabbing; }
+  .skel3d-stage canvas { width:100%; height:100%; display:block; }
+  .skel-ctrl { display:flex; align-items:center; gap:8px; padding:6px 2px; }
   .skel-stage video { width:100%; height:100%; object-fit:contain; display:block; max-height:none; }
   .skel-stage canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1; }
   .list-name { cursor:pointer; }
@@ -1152,6 +1202,7 @@ INDEX_HTML = r"""<!doctype html>
       <button class="nav" data-view="library"><span class="n">▤</span>原文件</button>
       <button class="nav" data-view="music"><span class="n">♪</span>音频分组</button>
       <button class="nav" data-view="dance"><span class="n">✣</span>动作分组</button>
+      <button class="nav" data-view="test"><span class="n">🧪</span>测试</button>
     </nav>
     <div class="foot">
       <div style="padding:0 10px 8px"><button id="anim-btn" class="ghost small" style="width:100%">缩略图：动图</button></div>
@@ -1277,6 +1328,79 @@ INDEX_HTML = r"""<!doctype html>
       <p class="sub">在每组音乐内按舞蹈动作再分。组名可点击改名。</p>
       <div id="dance-groups"></div>
     </div>
+
+    <!-- 测试 -->
+        <div class="view" id="view-test">
+      <h2>测试</h2>
+      <p class="sub">视频骨架 + OSR6 运动同步对比，下方为脚本信号。</p>
+      <div class="panel">
+        <div class="row">
+          <select id="test-video" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;max-width:320px"></select>
+          <button id="test-load" class="ghost small">加载</button>
+          <button id="test-play" class="ghost small">▶ 播放</button>
+          <input type="range" id="test-seek" min="0" max="100" value="0" style="flex:1;min-width:120px">
+          <span id="test-time" class="muted" style="width:48px">0.0s</span>
+          <label class="muted" style="white-space:nowrap"><input type="checkbox" id="test-3d-auto" checked> 3D自动旋转</label>
+        </div>
+      </div>
+      <div class="test-grid">
+        <div class="panel">
+          <b>视频骨架（2D 叠加）</b>
+          <div class="skel-stage" id="t2d-stage"><video id="t2d-video" playsinline preload="auto"></video><canvas id="t2d-canvas"></canvas></div>
+        </div>
+        <div class="panel">
+          <b>OSR6 运动（真实模型）</b>
+          <div id="osr6-emu" style="width:100%;height:340px;background:#0a0d12;border-radius:8px;overflow:hidden;margin-top:8px"></div>
+          <p class="muted" id="osr6-emu-hint" style="margin-top:6px">真实 3D 模型（MIT 许可 · ayvajs）· 拖动旋转</p>
+        </div>
+      </div>
+      <div class="panel">
+        <b>手动控制</b>
+        <label class="muted" style="display:inline-block;margin-bottom:6px"><input type="checkbox" id="manual-mode"> 手动模式（忽略信号，直接控制杯子）</label>
+        <div id="manual-sliders" style="display:none">
+          <div class="row" style="gap:8px;flex-wrap:wrap">
+            <label class="muted">L0 <input type="range" id="m-l0" min="0" max="100" value="50" style="width:110px;vertical-align:middle"> <span id="m-l0-v">50</span></label>
+            <label class="muted">L1 <input type="range" id="m-l1" min="0" max="100" value="50" style="width:110px;vertical-align:middle"> <span id="m-l1-v">50</span></label>
+            <label class="muted">L2 <input type="range" id="m-l2" min="0" max="100" value="50" style="width:110px;vertical-align:middle"> <span id="m-l2-v">50</span></label>
+            <label class="muted">R0 <input type="range" id="m-r0" min="0" max="100" value="50" style="width:110px;vertical-align:middle"> <span id="m-r0-v">50</span></label>
+            <label class="muted">R1 <input type="range" id="m-r1" min="0" max="100" value="50" style="width:110px;vertical-align:middle"> <span id="m-r1-v">50</span></label>
+            <label class="muted">R2 <input type="range" id="m-r2" min="0" max="100" value="50" style="width:110px;vertical-align:middle"> <span id="m-r2-v">50</span></label>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <b>脚本信息</b>
+        <p class="muted">六轴映射：L0=上下 · L1=左右 · L2=前后 · R0=扭转 · R1=俯仰 · R2=侧倾（已做断点插值 + 平滑）</p>
+        <div class="row" style="margin:6px 0 10px">
+          <label class="muted">主行程幅度 <input type="range" id="sig-gain" min="30" max="200" value="100" style="width:110px;vertical-align:middle"></label>
+        </div>
+        <div class="row" style="margin:4px 0 8px;flex-wrap:wrap">
+          <span class="muted">启用：</span>
+          <label class="muted">L0<input type="checkbox" id="en-l0" checked></label>
+          <label class="muted">L1<input type="checkbox" id="en-l1" checked></label>
+          <label class="muted">L2<input type="checkbox" id="en-l2" checked></label>
+          <label class="muted">R0<input type="checkbox" id="en-r0" checked></label>
+          <label class="muted">R1<input type="checkbox" id="en-r1" checked></label>
+          <label class="muted">R2<input type="checkbox" id="en-r2" checked></label>
+        </div>
+        <div class="row" style="margin:4px 0 8px;flex-wrap:wrap">
+          <span class="muted">反向：</span>
+          <label class="muted">L0<input type="checkbox" id="inv-l0" checked></label>
+          <label class="muted">L1<input type="checkbox" id="inv-l1"></label>
+          <label class="muted">L2<input type="checkbox" id="inv-l2"></label>
+          <label class="muted">R0<input type="checkbox" id="inv-r0"></label>
+          <label class="muted">R1<input type="checkbox" id="inv-r1"></label>
+          <label class="muted">R2<input type="checkbox" id="inv-r2"></label>
+        </div>
+        <canvas id="test-curve" height="150" style="width:100%;background:#0a0d12;border-radius:8px;display:block"></canvas>
+      </div>
+      <div class="panel">
+        <b>3D 骨架（调试，可拖动旋转）</b>
+        <div class="skel3d-stage"><canvas id="t3d-canvas"></canvas></div>
+      </div>
+    </div>
+
+    </div>
   </main>
 </div>
 
@@ -1284,7 +1408,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal-box">
     <div class="modal-head"><b id="preview-name"></b><button class="ghost small" id="preview-close">✕ 关闭</button></div>
     <div class="modal-body">
-      <div class="pv">
+      <div class="pv pv-skel2d">
         <div class="pv-title">骨架动作预览（叠加在片段上，带声音）</div>
         <div class="skel-stage">
           <video id="skel-video" controls playsinline preload="auto"></video>
@@ -1369,7 +1493,7 @@ document.getElementById("anim-btn").addEventListener("click", () => {
   if (document.getElementById("view-music").classList.contains("active")) loadGroups("music");
   if (document.getElementById("view-dance").classList.contains("active")) loadGroups("dance");
 });
-function switchView(name) {
+async function switchView(name) {
   document.querySelectorAll(".nav").forEach(b => b.classList.toggle("active", b.dataset.view === name));
   document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
   document.getElementById("view-"+name).classList.add("active");
@@ -1378,6 +1502,12 @@ function switchView(name) {
   if (name==="library") refreshLibrary();
   if (name==="task") refreshTask();
   if (name==="settings") refreshConfig();
+  if (name==="test") {
+    if (!st.videos.length) await refreshLibrary();
+    testPopulate();
+    if (!TEST.id && st.videos.length) testLoad();
+    initOsr6Emu();
+  }
 }
 
 // ---- 设置 ----
@@ -1576,7 +1706,8 @@ document.getElementById("btn-preview").addEventListener("click", () => {
   if (st.sel.size !== 1) { alert("请先选中一个视频（单选）进行预览"); return; }
   openPreview([...st.sel][0]);
 });
-async function openPreview(id, name, onlySkel) {
+async function openPreview(id, name, mode) {
+  const isSkel = (mode === true || mode === "skel");
   let title = name || (st.videos.find(x => x.id === id) || {}).name;
   if (!title) {
     const d = await api("/api/video_detail/" + id);
@@ -1584,10 +1715,10 @@ async function openPreview(id, name, onlySkel) {
   }
   $("#preview-name").textContent = title;
   document.querySelectorAll("#preview-modal .pv-other").forEach(el => {
-    el.style.display = onlySkel ? "none" : "";
+    el.style.display = isSkel ? "none" : "";
   });
   $("#preview-modal").style.display = "flex";
-  if (onlySkel) {
+  if (isSkel) {
     $("#pv-video").removeAttribute("src");
     $("#pv-clip").removeAttribute("src");
     $("#pv-audio").removeAttribute("src");
@@ -1704,6 +1835,443 @@ function stopSkel() {
   const v = $("#skel-video");
   if (v) { try { v.pause(); } catch (e) {} }
 }
+
+
+// ================= 测试栏目 =================
+const TEST = { id:null, p2:null, p3:null, fps:15, frame:0, playing:false, t0:0, raf:null,
+  yaw:0.6, pitch:0.12, dragging:false, lx:0, ly:0, auto3d:true, signals:null };
+
+function testVal(arr, f) { return (arr && arr[f] != null) ? arr[f] : 50; }
+
+function testPopulate() {
+  const sel = document.getElementById("test-video");
+  if (!sel) return;
+  const cur = TEST.id;
+  sel.innerHTML = "";
+  st.videos.forEach(v => {
+    const o = document.createElement("option");
+    o.value = v.id; o.textContent = v.name;
+    if (v.id === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+async function testLoad(id) {
+  id = id || parseInt(document.getElementById("test-video").value);
+  if (!id) return;
+  TEST.id = id;
+  const [d2, d3] = await Promise.all([api("/api/pose/" + id), api("/api/pose3d/" + id)]);
+  TEST.p2 = d2.ok ? d2 : null;
+  TEST.p3 = d3.ok ? d3 : null;
+  TEST.fps = (TEST.p2 && TEST.p2.fps) || (TEST.p3 && TEST.p3.fps) || 15;
+  TEST.frame = 0;
+  TEST.playing = false;
+  document.getElementById("test-play").textContent = "▶ 播放";
+  const v = document.getElementById("t2d-video");
+  if (v) { v.src = "/api/clip/" + id; v.load(); }
+  TEST.signals = testComputeSignals();
+  testDrawFrame(0);
+}
+
+function _slider(id, dflt) {
+  const el = document.getElementById(id);
+  return el ? parseFloat(el.value) : dflt;
+}
+
+function testComputeSignals() {
+  const p2 = TEST.p2 ? TEST.p2.landmarks : [];
+  const p3 = TEST.p3 ? TEST.p3.world : [];
+  const n = Math.max(p2.length, p3.length);
+
+  const fillNaNs = arr => {
+    const out = arr.slice();
+    let i = 0;
+    while (i < out.length) {
+      if (!isNaN(out[i])) { i++; continue; }
+      let j = i;
+      while (j < out.length && isNaN(out[j])) j++;
+      const prev = i > 0 ? out[i-1] : (j < out.length ? out[j] : 0);
+      const next = j < out.length ? out[j] : prev;
+      for (let k = i; k < j; k++) {
+        const t = (k - i + 1) / (j - i + 1);
+        out[k] = prev + (next - prev) * t;
+      }
+      i = j;
+    }
+    return out;
+  };
+  const smooth = (arr, k) => {
+    k = k || 3;
+    const out = arr.slice();
+    for (let i = 0; i < arr.length; i++) {
+      let sum = 0, c = 0;
+      for (let j = -k; j <= k; j++) { const t = i + j; if (t >= 0 && t < arr.length) { sum += arr[t]; c++; } }
+      out[i] = c ? sum / c : arr[i];
+    }
+    return out;
+  };
+  const norm01 = arr => {
+    const mn = Math.min(...arr), mx = Math.max(...arr), span = (mx - mn) || 1;
+    return arr.map(v => (v - mn) / span);
+  };
+  const clampJumps01 = (arr, maxD) => {
+    const out = arr.slice();
+    for (let i = 1; i < out.length; i++) {
+      const d = out[i] - out[i-1];
+      if (Math.abs(d) > maxD) out[i] = out[i-1] + Math.sign(d) * maxD;
+    }
+    return out;
+  };
+
+  // 髋部 2D（x=左右, y=上下）+ 身体尺寸（前后）
+  const wx = [], wy = [], wz = [];
+  for (let f = 0; f < n; f++) {
+    const fr = p2[f] || [];
+    const h23 = fr[23], h24 = fr[24];
+    if (h23 && h24) { wx.push((h23[0]+h24[0])/2); wy.push((h23[1]+h24[1])/2); }
+    else { wx.push(NaN); wy.push(NaN); }
+    const s11 = fr[11], s12 = fr[12];
+    wz.push((s11 && s12) ? Math.hypot(s12[0]-s11[0], s12[1]-s11[1]) : NaN);
+  }
+
+  // 3D 旋转：R0=扭转(肩线), R1=俯仰, R2=侧倾
+  const rawR0 = [], rawR1 = [], rawR2 = [];
+  for (let f = 0; f < n; f++) {
+    const fr = p2[f] || [];
+    const s11 = fr[11], s12 = fr[12];
+    rawR0.push((s11 && s12) ? Math.atan2(s12[1]-s11[1], s12[0]-s11[0]) : NaN);
+    const fw = p3[f] || [];
+    let pitch = NaN, roll = NaN;
+    if (fw.length >= 33 && fw[11] && fw[12] && fw[23] && fw[24]) {
+      const sm = [(fw[11][0]+fw[12][0])/2, (fw[11][1]+fw[12][1])/2, (fw[11][2]+fw[12][2])/2];
+      const hm = [(fw[23][0]+fw[24][0])/2, (fw[23][1]+fw[24][1])/2, (fw[23][2]+fw[24][2])/2];
+      const ux = sm[0]-hm[0], uy = sm[1]-hm[1], uz = sm[2]-hm[2];
+      if (Math.hypot(ux, uy, uz) > 1e-4) {
+        pitch = Math.atan2(uz, -uy);
+        roll = Math.atan2(ux, -uy);
+      }
+    }
+    rawR1.push(pitch); rawR2.push(roll);
+  }
+
+  const smooth01 = arr => {
+    let a = smooth(fillNaNs(arr), 4);
+    a = norm01(a);
+    a = clampJumps01(a, 0.05);
+    return smooth(a, 2);
+  };
+
+  const gain = _slider("sig-gain", 100) / 100;
+  const inv = id => {
+    const el = document.getElementById("inv-" + id);
+    return el && el.checked ? 1 : 0;
+  };
+  const flip = (arr, key) => inv(key) ? arr.map(v => 1 - v) : arr;
+  const enabled = id => {
+    const el = document.getElementById("en-" + id);
+    return !el || el.checked;
+  };
+  const hold = (arr, key) => enabled(key) ? arr : arr.map(() => 0.5);
+
+  const L0 = hold(flip(smooth01(wy), "l0"), "l0");   // 上下
+  const L1 = hold(flip(smooth01(wx), "l1"), "l1");   // 左右
+  const L2 = hold(flip(smooth01(wz), "l2"), "l2");   // 前后
+  const R0 = hold(flip(smooth01(rawR0), "r0"), "r0");
+  const R1 = hold(flip(smooth01(rawR1), "r1"), "r1");
+  const R2 = hold(flip(smooth01(rawR2), "r2"), "r2");
+
+  return {
+    L0: L0.map(v => 0.5 + (v - 0.5) * gain),
+    L1, L2, R0, R1, R2,
+  };
+}
+
+function testFrameCount() { return Math.max(TEST.p2 ? TEST.p2.frames : 0, TEST.p3 ? TEST.p3.frames : 0); }
+
+function testDrawFrame(idx) {
+  testDraw2d(idx);
+  testDraw3d(idx);
+  testDrawCurves(idx);
+  testDrawOsr6(idx);
+  const n = testFrameCount();
+  const sk = document.getElementById("test-seek");
+  if (sk) sk.value = n > 1 ? (idx / (n - 1)) * 100 : 0;
+  const tm = document.getElementById("test-time");
+  if (tm) tm.textContent = (idx / (TEST.fps || 15)).toFixed(1) + "s";
+}
+
+function testDraw2d(idx) {
+  const v = document.getElementById("t2d-video");
+  const cv = document.getElementById("t2d-canvas");
+  const d = TEST.p2;
+  if (!v || !cv || !d) return;
+  const W = v.clientWidth || 0, H = v.clientHeight || 0;
+  if (!W || !H) return;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  const vw = v.videoWidth || 0, vh = v.videoHeight || 0;
+  let rx = 0, ry = 0, rw = W, rh = H;
+  if (vw && vh) { const sc = Math.min(W/vw, H/vh); rw = vw*sc; rh = vh*sc; rx = (W-rw)/2; ry = (H-rh)/2; }
+  const fr = d.landmarks[idx] || [];
+  ctx.strokeStyle = "#5b8cff"; ctx.lineWidth = 2;
+  for (const ab of POSE_CONN) {
+    const a = fr[ab[0]], b = fr[ab[1]];
+    if (!a || !b) continue;
+    ctx.beginPath();
+    ctx.moveTo(rx + a[0]*rw, ry + a[1]*rh);
+    ctx.lineTo(rx + b[0]*rw, ry + b[1]*rh);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#ffd166";
+  for (const p of fr) { if (!p) continue; ctx.beginPath(); ctx.arc(rx + p[0]*rw, ry + p[1]*rh, 2.2, 0, Math.PI*2); ctx.fill(); }
+}
+
+function testDraw3d(idx) {
+  const cv = document.getElementById("t3d-canvas");
+  const d = TEST.p3;
+  if (!cv || !d) return;
+  const W = cv.clientWidth || 480, H = cv.clientHeight || 420;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0a0d12"; ctx.fillRect(0, 0, W, H);
+  const scale = Math.min(W, H) * 0.9;
+  const fr = d.world[idx] || [];
+  const cy = Math.cos(TEST.yaw), sy = Math.sin(TEST.yaw);
+  const cp = Math.cos(TEST.pitch), sp = Math.sin(TEST.pitch);
+  const proj = p => {
+    const x = p[0], y = -p[1], z = -p[2];
+    const x1 = x*cy - z*sy, z1 = x*sy + z*cy;
+    const y1 = y*cp - z1*sp, z2 = y*sp + z1*cp;
+    const persp = 1.8 / (1.8 + z2);
+    return [W/2 + x1*scale*persp, H/2 - y1*scale*persp];
+  };
+  const pts = fr.map(proj);
+  ctx.strokeStyle = "#5b8cff"; ctx.lineWidth = 2;
+  for (const ab of POSE_CONN) {
+    const a = pts[ab[0]], b = pts[ab[1]];
+    if (!a || !b) continue;
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  }
+  ctx.fillStyle = "#ffd166";
+  for (const p of pts) { ctx.beginPath(); ctx.arc(p[0], p[1], 2.4, 0, Math.PI*2); ctx.fill(); }
+}
+
+function testDrawCurves(idx) {
+  const cv = document.getElementById("test-curve");
+  const s = TEST.signals;
+  if (!cv || !s) return;
+  const W = cv.clientWidth || 600, H = 150;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  const axes = [["L0","#5b8cff"],["L1","#4bd08a"],["L2","#ffb454"],["R0","#ff6b6b"],["R1","#b48cff"],["R2","#e88cff"]];
+  const n = s.L0.length;
+  ctx.lineWidth = 1.4;
+  for (const kv of axes) {
+    const arr = s[kv[0]];
+    if (!arr || !arr.length) continue;
+    ctx.strokeStyle = kv[1];
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = (i / Math.max(1, n-1)) * W;
+      const y = H - arr[i] * (H - 6) - 3;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  if (n > 1) {
+    const px = (idx / (n - 1)) * W;
+    ctx.strokeStyle = "rgba(255,255,255,.8)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
+  }
+  ctx.font = "11px monospace";
+  axes.forEach((kv, i) => { ctx.fillStyle = kv[1]; ctx.fillText(kv[0], 8 + i*40, 14); });
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+let _osr6emu = null;
+let _osr6emuTried = false;
+
+async function initOsr6Emu() {
+  if (_osr6emu || _osr6emuTried) return;
+  _osr6emuTried = true;
+  const el = document.getElementById("osr6-emu");
+  if (!el) return;
+  try {
+    const mod = await import("/vendor/osr-emu/osr-emu.dist.module.min.js");
+    _osr6emu = new mod.OSREmulator(el, { model: "SR6" });
+    const hint = document.getElementById("osr6-emu-hint");
+    if (hint) hint.textContent = "模型已加载 · 拖动旋转";
+    emuWrite(TEST.frame);
+  } catch (e) {
+    console.warn("osr-emu 加载失败", e);
+    const hint = document.getElementById("osr6-emu-hint");
+    if (hint) hint.textContent = "3D 模拟器加载失败：" + (e && e.message ? e.message : e);
+  }
+}
+
+const manualVals = { L0: 50, L1: 50, L2: 50, R0: 50, R1: 50, R2: 50 };
+function manualMode() {
+  const el = document.getElementById("manual-mode");
+  return !!el && el.checked;
+}
+
+function emuWrite(idx) {
+  const hint = document.getElementById("osr6-emu-hint");
+  if (!_osr6emu) {
+    if (hint) hint.textContent = "模拟器未加载（导入失败？）";
+    return;
+  }
+  if (!manualMode() && !TEST.signals) {
+    if (hint) hint.textContent = "信号未就绪";
+    return;
+  }
+  const s = TEST.signals;
+  const AXES = ["L0", "L1", "L2", "R0", "R1", "R2"];
+  let v;
+  if (manualMode()) {
+    v = {
+      L0: manualVals.L0 * 99.99,
+      L1: manualVals.L1 * 99.99,
+      L2: manualVals.L2 * 99.99,
+      R0: manualVals.R0 * 99.99,
+      R1: manualVals.R1 * 99.99,
+      R2: manualVals.R2 * 99.99,
+    };
+  } else {
+    v = {
+      L0: testVal(s.L0, idx) * 9999,
+      L1: testVal(s.L1, idx) * 9999,
+      L2: testVal(s.L2, idx) * 9999,
+      R0: testVal(s.R0, idx) * 9999,
+      R1: testVal(s.R1, idx) * 9999,
+      R2: testVal(s.R2, idx) * 9999,
+    };
+  }
+  const cmd = AXES.map(a => {
+    const n = Math.max(0, Math.min(9999, Math.round(v[a])));
+    return a + String(n).padStart(4, "0") + "I50";
+  }).join(" ") + "\n";
+  try {
+    _osr6emu.write(cmd);
+    if (hint) hint.textContent = "L0=" + Math.round(v.L0/99.99) + " L1=" + Math.round(v.L1/99.99) + " L2=" + Math.round(v.L2/99.99) + " R0=" + Math.round(v.R0/99.99) + " R1=" + Math.round(v.R1/99.99) + " R2=" + Math.round(v.R2/99.99);
+  } catch (e) {
+    if (hint) hint.textContent = "写入错误：" + (e && e.message ? e.message : e);
+  }
+}
+
+function testDrawOsr6(idx) { emuWrite(idx); }
+
+function testPlayLoop() {
+  if (!TEST.playing) return;
+  const v = document.getElementById("t2d-video");
+  const t = (v && v.duration) ? v.currentTime : (performance.now() - TEST.t0) / 1000;
+  let idx = Math.floor(t * (TEST.fps || 15));
+  const n = testFrameCount();
+  if (idx >= n) { idx = Math.max(0, n - 1); TEST.playing = false; document.getElementById("test-play").textContent = "▶ 播放"; }
+  TEST.frame = idx;
+  testDrawFrame(idx);
+  TEST.raf = requestAnimationFrame(testPlayLoop);
+}
+
+function testTogglePlay() {
+  const v = document.getElementById("t2d-video");
+  if (!v || !TEST.id) return;
+  if (TEST.playing) {
+    TEST.playing = false; try { v.pause(); } catch(e){}
+    document.getElementById("test-play").textContent = "▶ 播放";
+    if (TEST.raf) { cancelAnimationFrame(TEST.raf); TEST.raf = null; }
+  } else {
+    TEST.playing = true;
+    document.getElementById("test-play").textContent = "⏸ 暂停";
+    try { v.play(); } catch(e){}
+    TEST.raf = requestAnimationFrame(testPlayLoop);
+  }
+}
+
+document.getElementById("test-load").addEventListener("click", () => testLoad());
+document.getElementById("test-play").addEventListener("click", testTogglePlay);
+document.getElementById("test-seek").addEventListener("input", e => {
+  const v = document.getElementById("t2d-video");
+  const n = testFrameCount();
+  const idx = Math.round((parseFloat(e.target.value) / 100) * (n - 1));
+  TEST.frame = idx;
+  if (v && v.duration) { try { v.currentTime = (idx / (TEST.fps || 15)); } catch(e){} }
+  testDrawFrame(idx);
+});
+document.getElementById("test-3d-auto").addEventListener("change", e => { TEST.auto3d = e.target.checked; });
+["l0","l1","l2","r0","r1","r2"].forEach(a => {
+  const el = document.getElementById("m-" + a);
+  if (el) el.addEventListener("input", () => {
+    manualVals[a.toUpperCase()] = parseFloat(el.value);
+    const lbl = document.getElementById("m-" + a + "-v");
+    if (lbl) lbl.textContent = el.value;
+    if (manualMode()) testDrawOsr6(TEST.frame);
+  });
+});
+document.getElementById("manual-mode").addEventListener("change", e => {
+  document.getElementById("manual-sliders").style.display = e.target.checked ? "" : "none";
+  testDrawOsr6(TEST.frame);
+});
+["l0","l1","l2","r0","r1","r2"].forEach(a => {
+  const el = document.getElementById("en-" + a);
+  if (el) el.addEventListener("change", () => {
+    TEST.signals = testComputeSignals();
+    testDrawCurves(TEST.frame);
+    testDrawOsr6(TEST.frame);
+  });
+});
+["l0","l1","l2","r0","r1","r2"].forEach(a => {
+  const el = document.getElementById("inv-" + a);
+  if (el) el.addEventListener("change", () => {
+    TEST.signals = testComputeSignals();
+    testDrawCurves(TEST.frame);
+    testDrawOsr6(TEST.frame);
+  });
+});
+["sig-gain"].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("input", () => {
+    TEST.signals = testComputeSignals();
+    testDrawCurves(TEST.frame);
+    testDrawOsr6(TEST.frame);
+  });
+});
+
+// 3D 拖动
+const _t3d = document.getElementById("t3d-canvas");
+_t3d.addEventListener("mousedown", e => { TEST.dragging = true; TEST.lx = e.clientX; TEST.ly = e.clientY; });
+window.addEventListener("mousemove", e => {
+  if (!TEST.dragging) return;
+  TEST.yaw += (e.clientX - TEST.lx) * 0.01;
+  TEST.pitch = Math.max(-1.2, Math.min(1.2, TEST.pitch + (e.clientY - TEST.ly) * 0.01));
+  TEST.lx = e.clientX; TEST.ly = e.clientY;
+  testDraw3d(TEST.frame);
+});
+window.addEventListener("mouseup", () => { TEST.dragging = false; });
+
+// （OSR6 视角由内置模拟器的轨道控制处理）
+
+// 3D 自动旋转
+setInterval(() => {
+  if (document.getElementById("view-test").classList.contains("active") && TEST.auto3d && !TEST.dragging) {
+    TEST.yaw += 0.008;
+    testDraw3d(TEST.frame);
+  }
+}, 40);
+
+
 
 // ---- 源文件详情 ----
 async function showDetail(id) {

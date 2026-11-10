@@ -121,37 +121,38 @@ def index_video(
         if not clip.exists():
             ffmpeg.cut_clip(path, clip, cfg.clip.start, cfg.clip.duration, cfg.clip.reencode, max_height=cfg.clip.max_height)
 
-        # 2) 音频（从原视频抽，长度独立于骨架片段）
-        wav = cdir / "audio.wav"
-        if not wav.exists():
-            adur = cfg.clip.audio_duration if cfg.clip.audio_duration > 0 else None
-            ffmpeg.extract_audio(path, wav, start=0.0, duration=adur, sample_rate=cfg.audio.sample_rate)
-        afeat = audio.feature_from_audio(
-            str(wav), sr=cfg.audio.sample_rate, hop_length=cfg.audio.hop_length,
-            match_fps=cfg.audio.match_fps, max_lag_sec=cfg.audio.max_lag_sec,
-        )
-        fp = audio.fingerprint(str(wav))
-        # 音频特征已入库，wav 只留给预览 → 压成 AAC 省空间
-        m4a = cdir / "audio.m4a"
-        if not m4a.exists():
-            try:
-                ffmpeg.to_aac(wav, m4a, bitrate="96k")
-                wav.unlink(missing_ok=True)
-            except Exception:
-                pass
-        store.set_audio(
-            vid,
-            {
-                "chroma": afeat["chroma"],
-                "chroma_full": afeat["chroma_full"],
-                "tempo": np.array(afeat["tempo"]),
-                "duration": np.array(afeat["duration"]),
-                "fps": np.array(afeat["fps"]),
-                "max_lag": np.array(afeat["max_lag"]),
-                "fingerprint": fp if fp is not None else np.zeros((0, 32), dtype=np.uint8),
-            },
-            tempo=afeat["tempo"],
-        )
+        # 2) 音频（从原视频抽，长度独立于骨架片段）。无音轨则跳过。
+        if info["has_audio"]:
+            wav = cdir / "audio.wav"
+            if not wav.exists():
+                adur = cfg.clip.audio_duration if cfg.clip.audio_duration > 0 else None
+                ffmpeg.extract_audio(path, wav, start=0.0, duration=adur, sample_rate=cfg.audio.sample_rate)
+            afeat = audio.feature_from_audio(
+                str(wav), sr=cfg.audio.sample_rate, hop_length=cfg.audio.hop_length,
+                match_fps=cfg.audio.match_fps, max_lag_sec=cfg.audio.max_lag_sec,
+            )
+            fp = audio.fingerprint(str(wav))
+            # 音频特征已入库，wav 只留给预览 → 压成 AAC 省空间
+            m4a = cdir / "audio.m4a"
+            if not m4a.exists():
+                try:
+                    ffmpeg.to_aac(wav, m4a, bitrate="96k")
+                    wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            store.set_audio(
+                vid,
+                {
+                    "chroma": afeat["chroma"],
+                    "chroma_full": afeat["chroma_full"],
+                    "tempo": np.array(afeat["tempo"]),
+                    "duration": np.array(afeat["duration"]),
+                    "fps": np.array(afeat["fps"]),
+                    "max_lag": np.array(afeat["max_lag"]),
+                    "fingerprint": fp if fp is not None else np.zeros((0, 32), dtype=np.uint8),
+                },
+                tempo=afeat["tempo"],
+            )
 
         # 3) 骨架特征
         seq = pose.extract_pose(
@@ -217,7 +218,7 @@ def ensure_video_cache(row: dict, cfg: AppConfig) -> Path:
 
     m4a = cdir / "audio.m4a"
     wav = cdir / "audio.wav"
-    if not m4a.exists() and not wav.exists():
+    if row.get("has_audio") and not m4a.exists() and not wav.exists():
         adur = cfg.clip.audio_duration if cfg.clip.audio_duration > 0 else None
         ffmpeg.extract_audio(src, wav, start=0.0, duration=adur, sample_rate=cfg.audio.sample_rate)
     if not m4a.exists() and wav.exists():
