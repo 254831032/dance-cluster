@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS videos (
     audio_npz     BLOB,
     motion_npz    BLOB,
     feature_version INTEGER DEFAULT 0,
+    funscript_count INTEGER DEFAULT 0,
+    funscript_axes  TEXT,
     updated_at    TEXT
 );
 
@@ -81,6 +83,17 @@ CREATE TABLE IF NOT EXISTS video_categories (
 
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
 CREATE INDEX IF NOT EXISTS idx_videos_groups ON videos(music_group, dance_group);
+CREATE INDEX IF NOT EXISTS idx_videos_name ON videos(name);
+CREATE INDEX IF NOT EXISTS idx_videos_dance ON videos(dance_group);
+CREATE INDEX IF NOT EXISTS idx_vc_category ON video_categories(category_id);
+
+CREATE TABLE IF NOT EXISTS pair_cache (
+    a_id  INTEGER NOT NULL,
+    b_id  INTEGER NOT NULL,
+    kind  TEXT    NOT NULL,
+    value REAL    NOT NULL,
+    PRIMARY KEY (a_id, b_id, kind)
+);
 """
 
 
@@ -105,18 +118,30 @@ class Store:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        self.conn = sqlite3.connect(str(self.path), timeout=10.0)
         self.conn.row_factory = sqlite3.Row
-        # WAL + 忙等待：减少多线程/后台任务与页面轮询并发读写时的 database is locked
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=5000")
+        # 先设忙等待，再切 WAL（顺序反了会在并发时直接 database is locked）
+        self.conn.execute("PRAGMA busy_timeout=8000")
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass  # 锁竞争时退回默认日志模式，不影响使用
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         # 迁移：老库补 feature_version 列
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(videos)")}
-        if "feature_version" not in cols:
-            self.conn.execute("ALTER TABLE videos ADD COLUMN feature_version INTEGER DEFAULT 0")
-            self.conn.commit()
+        # 并发打开时可能有竞态：另一连接已加列 -> 忽略 duplicate column
+        for col, ddl in (
+            ("feature_version", "INTEGER DEFAULT 0"),
+            ("funscript_count", "INTEGER DEFAULT 0"),
+            ("funscript_axes", "TEXT"),
+        ):
+            if col not in cols:
+                try:
+                    self.conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {ddl}")
+                except sqlite3.OperationalError:
+                    pass
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.commit()
@@ -173,6 +198,14 @@ class Store:
         )
         self.conn.commit()
 
+    def set_funscript(self, video_id: int, count: int, axes: list) -> None:
+        axes_json = json.dumps(list(axes), ensure_ascii=False) if axes else None
+        self.conn.execute(
+            "UPDATE videos SET funscript_count=?, funscript_axes=?, updated_at=? WHERE id=?",
+            (int(count), axes_json, _now(), video_id),
+        )
+        self.conn.commit()
+
     def get_by_id(self, video_id: int) -> dict | None:
         row = self.conn.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
         return dict(row) if row else None
@@ -190,6 +223,26 @@ class Store:
 
     def motion_features(self, row: dict) -> dict:
         return loads_npz(row.get("motion_npz"))
+
+    # ---------- 相似度缓存 ----------
+    def get_pair(self, a: int, b: int, kind: str):
+        row = self.conn.execute(
+            "SELECT value FROM pair_cache WHERE a_id=? AND b_id=? AND kind=?",
+            (min(a, b), max(a, b), kind),
+        ).fetchone()
+        return float(row["value"]) if row else None
+
+    def set_pair(self, a: int, b: int, kind: str, value: float) -> None:
+        # 不逐条 commit，由外层 close()/其它 commit 统一落盘
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pair_cache (a_id, b_id, kind, value) VALUES (?, ?, ?, ?)",
+            (min(a, b), max(a, b), kind, float(value)),
+        )
+
+    def invalidate_pairs(self, ids) -> None:
+        for vid in ids:
+            self.conn.execute("DELETE FROM pair_cache WHERE a_id=? OR b_id=?", (vid, vid))
+        self.conn.commit()
 
     def set_groups(self, assignments: list[tuple[int, int, int, float]]) -> None:
         """assignments: [(video_id, music_group, dance_group, confidence)]"""
@@ -283,7 +336,7 @@ class Store:
         """返回 [{key, name, members:[{id,name,status}]}]，name 未命名时用默认。"""
         col = "music_group" if group_type == "music" else "dance_group"
         rows = self.conn.execute(
-            f"SELECT id, name, status, {col} AS gkey FROM videos "
+            f"SELECT id, name, status, funscript_count, funscript_axes, {col} AS gkey FROM videos "
             f"WHERE {col} IS NOT NULL ORDER BY {col}, name"
         ).fetchall()
         named = {
@@ -296,7 +349,11 @@ class Store:
         for r in rows:
             k = int(r["gkey"])
             grouped.setdefault(k, {"key": k, "members": []})
-            grouped[k]["members"].append({"id": int(r["id"]), "name": r["name"], "status": r["status"]})
+            grouped[k]["members"].append({
+                "id": int(r["id"]), "name": r["name"], "status": r["status"],
+                "funscript_count": int(r["funscript_count"] or 0),
+                "funscript_axes": json.loads(r["funscript_axes"]) if r["funscript_axes"] else [],
+            })
         out = []
         for k in sorted(grouped):
             members = grouped[k]["members"]
@@ -320,6 +377,7 @@ class Store:
             "confidence=NULL, audio_npz=NULL, motion_npz=NULL, updated_at=? WHERE id=?",
             (_now(), video_id),
         )
+        self.conn.execute("DELETE FROM pair_cache WHERE a_id=? OR b_id=?", (video_id, video_id))
         self.conn.commit()
 
     def delete_videos(self, ids: list[int]) -> None:
@@ -328,6 +386,8 @@ class Store:
         marks = ",".join("?" for _ in ids)
         self.conn.execute(f"DELETE FROM video_categories WHERE video_id IN ({marks})", ids)
         self.conn.execute(f"DELETE FROM videos WHERE id IN ({marks})", ids)
+        for vid in ids:
+            self.conn.execute("DELETE FROM pair_cache WHERE a_id=? OR b_id=?", (vid, vid))
         self.conn.commit()
 
     def video_categories(self) -> dict[int, list[int]]:

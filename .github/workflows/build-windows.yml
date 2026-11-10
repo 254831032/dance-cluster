@@ -37,8 +37,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path models | Out-Null
-          Invoke-WebRequest -Uri "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task" -OutFile models/pose_landmarker_heavy.task
-          Get-Item models/pose_landmarker_heavy.task | Select-Object Length
+          foreach ($m in @("heavy", "full", "lite")) {
+            Invoke-WebRequest -Uri "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_$m/float16/1/pose_landmarker_$m.task" -OutFile "models/pose_landmarker_$m.task"
+          }
+          Get-ChildItem models | Select-Object Name, Length
 
       - name: Build exe
         run: pyinstaller --noconfirm dance-cluster.spec

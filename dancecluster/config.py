@@ -110,9 +110,21 @@ class AudioConfig:
     max_lag_sec: float = 3.0
 
 
+MODEL_FILES = {
+    "heavy": "pose_landmarker_heavy.task",
+    "full": "pose_landmarker_full.task",
+    "lite": "pose_landmarker_lite.task",
+}
+MODEL_LABELS = {
+    "heavy": "Heavy（最准，慢）",
+    "full": "Full（均衡）",
+    "lite": "Lite（最快，精度低）",
+}
+
+
 @dataclass
 class PoseConfig:
-    model_path: str = str(PROJECT_ROOT / "models" / "pose_landmarker_heavy.task")
+    model: str = "heavy"  # heavy / full / lite
     num_poses: int = 3
     min_detection_confidence: float = 0.5
     min_presence_confidence: float = 0.5
@@ -120,6 +132,10 @@ class PoseConfig:
     target_fps: float = 15.0          # 下游统一重采样到的帧率
     smooth_window: int = 5            # 平滑窗口（帧）
     min_visibility: float = 0.35      # 低于该可见度的点视为缺失
+
+    def model_file(self) -> Path:
+        name = MODEL_FILES.get(self.model, MODEL_FILES["heavy"])
+        return PROJECT_ROOT / "models" / name
 
 
 @dataclass

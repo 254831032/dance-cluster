@@ -14,9 +14,11 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dyn
 datas = []
 binaries = []
 
-# 姿态模型
-if os.path.exists(os.path.join("models", "pose_landmarker_heavy.task")):
-    datas.append(("models/pose_landmarker_heavy.task", "models"))
+# 姿态模型（heavy / full / lite 三档，设置里可选）
+for m in ("heavy", "full", "lite"):
+    p = os.path.join("models", f"pose_landmarker_{m}.task")
+    if os.path.exists(p):
+        datas.append((p, "models"))
 
 # ffmpeg / ffprobe
 for exe in ("ffmpeg", "ffprobe"):

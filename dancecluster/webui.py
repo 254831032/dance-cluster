@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import socket
 import sys
@@ -20,9 +22,9 @@ import traceback
 import webbrowser
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 
-from . import config, ffmpeg, pipeline, pose
+from . import config, ffmpeg, funscript, pipeline, pose
 from .config import AppConfig
 from .db import Store
 
@@ -58,6 +60,9 @@ def _current_cache_dir() -> str:
 def _cfg() -> AppConfig:
     cfg = AppConfig()
     cfg.cache_dir = _current_cache_dir()
+    s = config.load_settings()
+    m = s.get("model", "heavy")
+    cfg.pose.model = m if m in config.MODEL_FILES else "heavy"
     return cfg
 
 
@@ -119,6 +124,125 @@ def _ensure_cache(row) -> bool:
     return True
 
 
+# ---------- 缩略图：原子生成 + 后台预热 ----------
+def _thumb_dir() -> Path:
+    return Path(_current_cache_dir()) / "thumbs"
+
+
+_THUMB_FILES = {
+    "thumb": "{id}.jpg",
+    "gif": "{id}.gif",
+    "skel": "{id}_skel.png",
+    "skel_gif": "{id}_skel.gif",
+    "preview": "{id}_preview.mp4",
+}
+
+
+def _thumb_path(video_id: int, kind: str) -> Path:
+    return _thumb_dir() / _THUMB_FILES[kind].format(id=video_id)
+
+
+def _get_row(video_id: int):
+    try:
+        store = _store()
+    except RuntimeError:
+        return None
+    try:
+        return store.get_by_id(video_id)
+    finally:
+        store.close()
+
+
+def _atomic_generate(generate_fn, out: Path) -> bool:
+    """生成到临时文件，成功后原子替换；失败清理，保证下次可重试。
+
+    临时名保留原扩展名（.jpg/.gif/.mp4），否则 ffmpeg 无法按扩展名判断格式。
+    """
+    out = Path(out)
+    tmp = out.with_name(out.stem + ".part" + out.suffix)
+    try:
+        generate_fn(tmp)
+        if not tmp.exists():
+            return False
+        os.replace(tmp, out)
+        return True
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _generate_thumb(video_id: int, kind: str, row: dict, out: Path) -> None:
+    cdir = Path(row["cache_dir"])
+    aspect = (row["width"] / row["height"]) if (row["width"] and row["height"]) else 0.75
+    if kind == "thumb":
+        ffmpeg.extract_thumbnail(row["path"], out, at=1.0)
+    elif kind == "gif":
+        dur = max(2.0, min(float(row["duration"] or 8.0), 6.0))
+        ffmpeg.extract_gif(row["path"], out, at=0.0, duration=dur, fps=3, width=160)
+    elif kind == "skel":
+        pose_npz = cdir / "pose.npz"
+        if pose_npz.exists():
+            pose.render_skeleton_frame(pose_npz, out, width=320, aspect=aspect)
+    elif kind == "skel_gif":
+        pose_npz = cdir / "pose.npz"
+        if pose_npz.exists():
+            clip_sec = min(float(row["duration"] or 8.0), 20.0)
+            pose.render_skeleton_gif(pose_npz, out, fps=6,
+                                     max_seconds=max(2, int(min(clip_sec, 12.0))),
+                                     width=320, aspect=aspect)
+    elif kind == "preview":
+        pose_npz = cdir / "pose.npz"
+        audio = cdir / "audio.m4a"
+        if not audio.exists():
+            audio = cdir / "audio.wav"
+        if pose_npz.exists() and audio.exists():
+            pose.render_preview_video(pose_npz, audio, out, fps=6, width=320, aspect=aspect)
+
+
+_thumb_locks: dict = {}
+_thumb_locks_guard = threading.Lock()
+
+
+def _thumb_lock(key) -> threading.Lock:
+    with _thumb_locks_guard:
+        return _thumb_locks.setdefault(key, threading.Lock())
+
+
+def _generate_thumb_sync(video_id: int, kind: str) -> Path | None:
+    """按需同步生成缩略图（带 per-key 锁，避免并发重复生成）。
+
+    成功返回路径；失败返回 None（不落盘残缺文件，下次请求自动重试）。
+    """
+    out = _thumb_path(video_id, kind)
+    if out.exists():
+        return out
+    row = _get_row(video_id)
+    if row is None:
+        return None
+    key = (video_id, kind)
+    with _thumb_lock(key):
+        if out.exists():
+            return out
+        if _atomic_generate(lambda tmp: _generate_thumb(video_id, kind, row, tmp), out):
+            return out
+        return None
+
+
+def pre_generate_thumbs(ids) -> None:
+    """提取完成后后台预热缩略图 / GIF / 骨架视频（不阻塞，复用同一套同步生成）。"""
+    def _worker():
+        for vid in ids:
+            for kind in ("thumb", "gif", "preview"):
+                try:
+                    _generate_thumb_sync(vid, kind)
+                except Exception:
+                    pass
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _snapshot() -> dict:
     with _lock:
         return {
@@ -173,6 +297,7 @@ def _run_job(params: dict) -> None:
             raise _Cancelled()
         _log(f"提取完成，正在分组…")
         pipeline.group(records, cfg)
+        pre_generate_thumbs([r.id for r in records])
         after = _counts(_store())
         _log(
             f"完成：共 {after['total']} 个视频，"
@@ -211,6 +336,8 @@ def get_config():
         "cache_dir": cache_dir,
         "configured": bool(cache_dir),
         "suggested": _writable_default_cache(),
+        "model": s.get("model", "heavy"),
+        "models": [{"value": k, "label": v} for k, v in config.MODEL_LABELS.items()],
     })
 
 
@@ -234,6 +361,9 @@ def set_config():
     resolved = str(p.resolve())
     s = config.load_settings()
     s["cache_dir"] = resolved
+    m = str(body.get("model", s.get("model", "heavy")))
+    if m in config.MODEL_FILES:
+        s["model"] = m
     config.save_settings(s)
     _app_state["cache_dir"] = resolved
     # 立刻初始化数据库，让后续操作有表可用
@@ -271,6 +401,8 @@ def library():
                 "cats": cat_map.get(int(r["id"]), []),
                 "music_name": music_names.get(r["music_group"], f"M{r['music_group']}") if r["music_group"] is not None else None,
                 "dance_name": dance_names.get(r["dance_group"], f"D{r['dance_group']}") if r["dance_group"] is not None else None,
+                "funscript_count": int(r["funscript_count"] or 0),
+                "funscript_axes": json.loads(r["funscript_axes"]) if r["funscript_axes"] else [],
             }
             for r in store.all_videos()
         ]
@@ -338,6 +470,47 @@ def run():
     return jsonify({"ok": True})
 
 
+# ---------- funscript ----------
+@app.post("/api/funscripts/scan")
+def funscripts_scan():
+    body = request.get_json(force=True, silent=True) or {}
+    ids = [int(x) for x in body.get("ids", [])]
+    if not ids:
+        try:
+            store = _store()
+        except RuntimeError:
+            return jsonify({"ok": False, "error": "请先设置缓存目录"}), 400
+        try:
+            ids = [int(r["id"]) for r in store.all_videos()]
+        finally:
+            store.close()
+    stats = pipeline.scan_funscripts(ids, _cfg())
+    return jsonify({"ok": True, **stats})
+
+
+@app.get("/api/funscript/<int:video_id>")
+def funscript_detail(video_id):
+    row = _get_row(video_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    try:
+        files = funscript.find_for(row["path"])
+    except Exception:
+        files = []
+    axes = []
+    for axis, path in files:
+        info = funscript.parse(path)
+        axes.append({
+            "axis": axis,
+            "path": str(path),
+            "count": info["count"],
+            "duration_ms": info["duration_ms"],
+            "speed": info["speed"],
+            "actions": info["actions"],
+        })
+    return jsonify({"ok": True, "count": len(axes), "axes": axes})
+
+
 # ---------- 分组 ----------
 @app.get("/api/groups")
 def groups():
@@ -372,105 +545,51 @@ def groups_rename():
 
 @app.get("/api/thumb_gif/<int:video_id>")
 def thumb_gif(video_id):
-    store = _store()
-    try:
-        row = store.get_by_id(video_id)
-    finally:
-        store.close()
-    if not row:
+    out = _generate_thumb_sync(video_id, "gif")
+    if out is None:
         return ("", 404)
-    out = Path(_current_cache_dir()) / "thumbs" / f"{video_id}.gif"
-    if not out.exists():
-        try:
-            dur = max(2.0, min(float(row["duration"] or 8.0), 6.0))
-            ffmpeg.extract_gif(row["path"], out, at=0.0, duration=dur, fps=3, width=160)
-        except Exception:
-            return ("", 404)
     return send_file(out, mimetype="image/gif")
 
 
 @app.get("/api/preview/<int:video_id>")
 def preview_video(video_id):
-    store = _store()
-    try:
-        row = store.get_by_id(video_id)
-    finally:
-        store.close()
-    if not row:
+    row = _get_row(video_id)
+    if row is None:
         return ("", 404)
     if not _ensure_cache(row):
         return ("", 404)
-    cdir = Path(row["cache_dir"])
-    pose_npz = cdir / "pose.npz"
-    audio = cdir / "audio.m4a"
-    if not audio.exists():
-        audio = cdir / "audio.wav"
-    if not pose_npz.exists() or not audio.exists():
-        return ("", 404)
-    aspect = (row["width"] / row["height"]) if (row["width"] and row["height"]) else 0.75
-    out = Path(_current_cache_dir()) / "thumbs" / f"{video_id}_preview.mp4"
+    out = _thumb_path(video_id, "preview")
     if not out.exists():
-        try:
-            pose.render_preview_video(pose_npz, audio, out, fps=6, width=320, aspect=aspect)
-        except Exception:
+        if not _atomic_generate(lambda tmp: _generate_thumb(video_id, "preview", row, tmp), out):
             return ("", 404)
-    if not out.exists():
-        return ("", 404)
     return send_file(out, conditional=True, mimetype="video/mp4")
 
 
 @app.get("/api/skeleton_gif/<int:video_id>")
 def skeleton_gif(video_id):
-    store = _store()
-    try:
-        row = store.get_by_id(video_id)
-    finally:
-        store.close()
-    if not row:
+    row = _get_row(video_id)
+    if row is None:
         return ("", 404)
     if not _ensure_cache(row):
         return ("", 404)
-    pose_npz = Path(row["cache_dir"]) / "pose.npz"
-    if not pose_npz.exists():
-        return ("", 404)
-    aspect = (row["width"] / row["height"]) if (row["width"] and row["height"]) else 0.75
-    out = Path(_current_cache_dir()) / "thumbs" / f"{video_id}_skel.gif"
+    out = _thumb_path(video_id, "skel_gif")
     if not out.exists():
-        try:
-            clip_sec = min(float(row["duration"] or 8.0), 20.0)
-            pose.render_skeleton_gif(pose_npz, out, fps=6,
-                                     max_seconds=max(2, int(min(clip_sec, 12.0))),
-                                     width=320, aspect=aspect)
-        except Exception:
+        if not _atomic_generate(lambda tmp: _generate_thumb(video_id, "skel_gif", row, tmp), out):
             return ("", 404)
-    if not out.exists():
-        return ("", 404)
     return send_file(out, mimetype="image/gif")
 
 
 @app.get("/api/skeleton/<int:video_id>")
 def skeleton_frame(video_id):
-    store = _store()
-    try:
-        row = store.get_by_id(video_id)
-    finally:
-        store.close()
-    if not row:
+    row = _get_row(video_id)
+    if row is None:
         return ("", 404)
     if not _ensure_cache(row):
         return ("", 404)
-    pose_npz = Path(row["cache_dir"]) / "pose.npz"
-    if not pose_npz.exists():
-        return ("", 404)
-    aspect = (row["width"] / row["height"]) if (row["width"] and row["height"]) else 0.75
-    out = Path(_current_cache_dir()) / "thumbs" / f"{video_id}_skel.png"
+    out = _thumb_path(video_id, "skel")
     if not out.exists():
-        try:
-            pose.render_skeleton_frame(pose_npz, out, width=320, aspect=aspect)
-        except Exception:
+        if not _atomic_generate(lambda tmp: _generate_thumb(video_id, "skel", row, tmp), out):
             return ("", 404)
-    if not out.exists():
-        return ("", 404)
     return send_file(out, mimetype="image/png")
 
 
@@ -526,22 +645,9 @@ def audio_stream(video_id):
 # ---------- 缩略图 ----------
 @app.get("/api/thumb/<int:video_id>")
 def thumb(video_id):
-    try:
-        store = _store()
-    except RuntimeError:
+    out = _generate_thumb_sync(video_id, "thumb")
+    if out is None:
         return ("", 404)
-    try:
-        row = store.get_by_id(video_id)
-    finally:
-        store.close()
-    if not row:
-        return ("", 404)
-    out = Path(_current_cache_dir()) / "thumbs" / f"{video_id}.jpg"
-    if not out.exists():
-        try:
-            ffmpeg.extract_thumbnail(row["path"], out, at=1.0)
-        except Exception:
-            return ("", 404)
     return send_file(out, mimetype="image/jpeg")
 
 
@@ -867,6 +973,10 @@ INDEX_HTML = r"""<!doctype html>
   .card .badges { margin-top:4px; display:flex; gap:4px; flex-wrap:wrap; }
   .badge { font-size:11px; border-radius:5px; padding:1px 6px; background:#1c222d; color:var(--dim); }
   .badge.np { color:var(--bad); }
+  .badge.fs-none { color:var(--dim); }
+  .badge.fs-single { color:#7aa2ff; border:1px solid #2c4166; }
+  .badge.fs-multi { color:var(--ok); border:1px solid #2a4a3a; }
+  .pv canvas { width:100%; height:120px; background:#0c0f15; border-radius:8px; display:block; }
   .badge.done { color:var(--ok); }
   .badge.extracting { color:var(--warn); }
   .thumb-sm { width:64px; height:36px; object-fit:cover; border-radius:4px; vertical-align:middle; background:#0a0d12; }
@@ -928,6 +1038,11 @@ INDEX_HTML = r"""<!doctype html>
           <button id="btn-save-cache">保存并启用</button>
         </div>
         <p class="muted" id="cache-hint"></p>
+        <div class="row" style="margin-top:14px">
+          <label for="pose-model" style="margin-right:10px; white-space:nowrap">MediaPipe 模型</label>
+          <select id="pose-model" style="flex:1"></select>
+        </div>
+        <p class="muted">模型决定骨架精度与速度：Heavy 最准但慢、Full 均衡、Lite 最快但精度低。切换后，已完成的视频会在下次运行时自动重新提取。</p>
         <div class="row" style="margin-top:18px; padding-top:14px; border-top:1px solid var(--line)">
           <button id="btn-clear" class="ghost" style="color:var(--bad)">清除全部数据（重新开始）</button>
         </div>
@@ -988,6 +1103,12 @@ INDEX_HTML = r"""<!doctype html>
           <input type="text" id="search" placeholder="搜索文件名…" style="flex:1;max-width:260px">
           <div class="msel"><button id="msel-music-btn" class="ghost small" data-label="音乐分组">音乐分组 ▾</button><div id="msel-music" class="msel-panel"></div></div>
           <div class="msel"><button id="msel-dance-btn" class="ghost small" data-label="动作分组">动作分组 ▾</button><div id="msel-dance" class="msel-panel"></div></div>
+          <select id="fs-filter" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+            <option value="all">全部脚本状态</option>
+            <option value="none">无脚本</option>
+            <option value="single">单轴</option>
+            <option value="multi">多轴</option>
+          </select>
           <button id="btn-reset-filter" class="ghost small">重置</button>
         </div>
         <div id="cat-bar" style="margin-top:8px"></div>
@@ -1000,6 +1121,7 @@ INDEX_HTML = r"""<!doctype html>
           <select id="assign-cat" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px"></select>
           <button id="btn-assign" class="ghost small">归入分类</button>
           <button id="btn-preview" class="ghost small">预览</button>
+          <button id="btn-scan-fs" class="ghost small">扫描脚本</button>
           <button id="btn-reextract" class="ghost small">重新提取</button>
           <button id="btn-delete" class="ghost small" style="color:var(--bad)">删除</button>
         </div>
@@ -1031,13 +1153,17 @@ INDEX_HTML = r"""<!doctype html>
       <div class="pv"><div class="pv-title">原视频</div><video id="pv-video" controls playsinline></video></div>
       <div class="pv"><div class="pv-title">动作片段（前 20 秒）</div><video id="pv-clip" controls playsinline></video></div>
       <div class="pv"><div class="pv-title">提取的音频</div><audio id="pv-audio" controls></audio></div>
+      <div class="pv" id="pv-fs-wrap" style="display:none">
+        <div class="pv-title" id="pv-fs-title">Funscript 动作曲线</div>
+        <canvas id="pv-fs-canvas" height="120"></canvas>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
-const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), selTask:new Set(), search:"", fMusic:new Set(), fDance:new Set() };
+const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), selTask:new Set(), search:"", fMusic:new Set(), fDance:new Set(), fsLevel:"all", fsAxes:[], fsMaxAt:1 };
 
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 async function post(path, body) { return api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})}); }
@@ -1046,6 +1172,12 @@ function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;","
 function statusBadge(s) {
   const m = {ok:["done","已完成"], no_pose:["np","无骨架"], extracting:["extracting","提取中"], pending:["","待处理"], error:["np","出错"]}[s]||["",""];
   return `<span class="badge ${m[0]}">${m[1]||s}</span>`;
+}
+function funscriptBadge(v) {
+  const n = v.funscript_count || 0;
+  if (n <= 0) return `<span class="badge fs-none">无脚本</span>`;
+  if (n === 1) return `<span class="badge fs-single">单轴</span>`;
+  return `<span class="badge fs-multi">多轴×${n}</span>`;
 }
 
 // ---- 导航 ----
@@ -1071,7 +1203,7 @@ function switchView(name) {
 
 // ---- 设置 ----
 document.getElementById("btn-save-cache").addEventListener("click", async () => {
-  const r = await post("/api/config/set", {cache_dir: $("#cache-dir").value});
+  const r = await post("/api/config/set", {cache_dir: $("#cache-dir").value, model: $("#pose-model").value});
   if (!r.ok) { $("#cache-hint").textContent = "✗ " + (r.error||"失败"); $("#cache-hint").style.color="var(--bad)"; return; }
   $("#cache-hint").textContent = "✓ 已启用：" + r.cache_dir; $("#cache-hint").style.color="var(--ok)";
   await refreshConfig(); switchView("task");
@@ -1092,6 +1224,14 @@ document.getElementById("btn-clear").addEventListener("click", async () => {
 async function refreshConfig() {
   const c = await api("/api/config");
   st.configured = c.configured; $("#cache-dir").value = c.cache_dir||"";
+  const sel = $("#pose-model");
+  sel.innerHTML = "";
+  (c.models||[]).forEach(m => {
+    const o = document.createElement("option");
+    o.value = m.value; o.textContent = m.label;
+    if (m.value === c.model) o.selected = true;
+    sel.appendChild(o);
+  });
   if (!c.configured && c.suggested) $("#cache-hint").textContent = "建议：" + c.suggested;
   applyGate();
 }
@@ -1132,6 +1272,9 @@ async function refreshTask() {
 function showTaskMsg(t) { const el = $("#task-msg"); el.textContent = t; el.style.color = "var(--ok)"; }
 function renderTaskList(videos) {
   const el = $("#task-list");
+  // 只保留仍在「待提取」里的选择，避免提取完成后误删已完成的视频
+  const valid = new Set(videos.map(v => v.id));
+  for (const id of [...st.selTask]) if (!valid.has(id)) st.selTask.delete(id);
   $("#task-empty").style.display = videos.length ? "none" : "";
   $("#task-sel-info").textContent = st.selTask.size ? `已选 ${st.selTask.size} 个` : "未选择";
   el.innerHTML = "";
@@ -1184,7 +1327,13 @@ async function poll() {
   $("#fill").style.width = pct+"%";
   $("#status").textContent = s.running ? `[${s.progress}/${s.total}] ${s.name} · ${s.stage}` : s.stage;
   if (s.log && s.log.length) { $("#log").textContent = s.log.join("\n"); $("#log").scrollTop=$("#log").scrollHeight; }
-  if (!s.running) { $("#btn-run").disabled=false; $("#btn-cancel").disabled=true; if (st.timer){clearInterval(st.timer); st.timer=null;} refreshLibrary(); }
+  if (!s.running) {
+    $("#btn-run").disabled=false; $("#btn-cancel").disabled=true;
+    if (st.timer){clearInterval(st.timer); st.timer=null;}
+    st.selTask.clear();
+    refreshLibrary();
+    refreshTask();
+  }
 }
 
 // ---- 原文件：视频浏览（多选）----
@@ -1227,6 +1376,13 @@ document.getElementById("btn-assign").addEventListener("click", async () => {
   const r = await post("/api/videos/assign", {ids:[...st.sel], category_id:cat});
   if (r.ok) { st.sel.clear(); refreshLibrary(); } else alert(r.error);
 });
+document.getElementById("btn-scan-fs").addEventListener("click", async () => {
+  const ids = [...st.sel];
+  const r = await post("/api/funscripts/scan", ids.length ? {ids} : {});
+  if (!r.ok) { alert(r.error || "扫描失败"); return; }
+  alert(`扫描 ${r.scanned} 个视频\n有脚本 ${r.with_script} 个（单轴 ${r.single}、多轴 ${r.multi}）\n无脚本 ${r.none} 个`);
+  refreshLibrary();
+});
 document.getElementById("btn-preview").addEventListener("click", () => {
   if (st.sel.size !== 1) { alert("请先选中一个视频（单选）进行预览"); return; }
   const id = [...st.sel][0];
@@ -1237,6 +1393,49 @@ document.getElementById("btn-preview").addEventListener("click", () => {
   $("#pv-clip").src = "/api/clip/" + id;
   $("#pv-audio").src = "/api/audio/" + id;
   $("#preview-modal").style.display = "flex";
+  loadPreviewFunscript(id);
+});
+
+async function loadPreviewFunscript(videoId) {
+  const wrap = $("#pv-fs-wrap");
+  const d = await api("/api/funscript/" + videoId);
+  const axes = (d.axes || []).filter(a => a.actions && a.actions.length);
+  st.fsAxes = axes;
+  if (!axes.length) { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+  $("#pv-fs-title").textContent = "Funscript 动作曲线（" + axes.map(a => a.axis).join(" / ") + "）";
+  st.fsMaxAt = Math.max(...axes.map(a => a.actions[a.actions.length - 1][0] || 1));
+  drawFunscriptCurve(null);
+}
+function drawFunscriptCurve(t) {
+  const cv = $("#pv-fs-canvas");
+  if (!cv || !st.fsAxes || !st.fsAxes.length) return;
+  const w = cv.clientWidth || 600;
+  cv.width = w; cv.height = 120;
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, w, 120);
+  const colors = ["#5b8cff", "#4bd08a", "#ffb454", "#ff6b6b", "#b48cff"];
+  const maxAt = st.fsMaxAt || 1;
+  st.fsAxes.forEach((a, idx) => {
+    ctx.strokeStyle = colors[idx % colors.length];
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    a.actions.forEach((pt, i) => {
+      const x = (pt[0] / maxAt) * (w - 2) + 1;
+      const y = 118 - (pt[1] / 100) * 116;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+  if (t != null && isFinite(t)) {
+    const x = Math.max(0, Math.min(w, (t / maxAt) * w));
+    ctx.strokeStyle = "rgba(255,255,255,.8)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 120); ctx.stroke();
+  }
+}
+$("#pv-video").addEventListener("timeupdate", e => {
+  if (st.fsAxes && st.fsAxes.length) drawFunscriptCurve(e.target.currentTime * 1000);
 });
 document.getElementById("preview-close").addEventListener("click", () => {
   $("#preview-modal").style.display = "none";
@@ -1317,9 +1516,11 @@ function renderGroupFilters() {
   updateMselLabel("msel-dance-btn", st.fDance);
 }
 document.getElementById("search").addEventListener("input", e => { st.search = e.target.value.trim(); renderVideos(); });
+document.getElementById("fs-filter").addEventListener("change", e => { st.fsLevel = e.target.value; renderVideos(); });
 document.getElementById("btn-reset-filter").addEventListener("click", () => {
   st.search = ""; $("#search").value = "";
   st.fMusic.clear(); st.fDance.clear(); st.filterCat = null;
+  st.fsLevel = "all"; $("#fs-filter").value = "all";
   renderCatBar(); renderGroupFilters(); renderVideos();
 });
 document.getElementById("msel-music-btn").addEventListener("click", e => {
@@ -1341,6 +1542,14 @@ function filteredVideos() {
   if (st.search) list = list.filter(v => v.name.toLowerCase().includes(st.search.toLowerCase()));
   if (st.fMusic.size) list = list.filter(v => v.music_group != null && st.fMusic.has(v.music_group));
   if (st.fDance.size) list = list.filter(v => v.dance_group != null && st.fDance.has(v.dance_group));
+  if (st.fsLevel !== "all") {
+    list = list.filter(v => {
+      const n = v.funscript_count || 0;
+      if (st.fsLevel === "none") return n === 0;
+      if (st.fsLevel === "single") return n === 1;
+      return n >= 2;  // multi
+    });
+  }
   return list;
 }
 function renderVideos() {
@@ -1358,7 +1567,7 @@ function toggleSel(id) {
 function listTable(list) {
   const t = document.createElement("table");
   const thead = document.createElement("thead");
-  thead.innerHTML = `<tr><th style="width:30px"></th><th style="width:76px"></th><th>文件</th><th>时长</th><th>音乐组</th><th>动作组</th><th>状态</th></tr>`;
+  thead.innerHTML = `<tr><th style="width:30px"></th><th style="width:76px"></th><th>文件</th><th>时长</th><th>音乐组</th><th>动作组</th><th>脚本</th><th>状态</th></tr>`;
   const tb = document.createElement("tbody");
   list.forEach(v => {
     const tr = document.createElement("tr");
@@ -1371,6 +1580,7 @@ function listTable(list) {
       <td>${esc(v.name)}</td><td>${v.duration}s</td>
       <td>${v.music_name||"-"}</td>
       <td>${v.dance_name||"-"}</td>
+      <td>${funscriptBadge(v)}</td>
       <td>${statusBadge(v.status)}</td>`;
     tr.addEventListener("click", e => {
       if (e.target.dataset.cb === "") { toggleSel(v.id); }
@@ -1390,7 +1600,7 @@ function gridCard(v) {
   const src = st.anim ? "/api/thumb_gif/"+v.id : "/api/thumb/"+v.id;
   d.innerHTML = `<input type="checkbox" class="ck" ${checked}><img src="${src}" loading="lazy">
     <div class="meta"><div class="name">${esc(v.name)}</div>
-    <div class="badges">${statusBadge(v.status)}${v.music_name?`<span class="badge">${esc(v.music_name)}</span>`:""}${v.dance_name?`<span class="badge">${esc(v.dance_name)}</span>`:""}</div></div>`;
+    <div class="badges">${statusBadge(v.status)}${funscriptBadge(v)}${v.music_name?`<span class="badge">${esc(v.music_name)}</span>`:""}${v.dance_name?`<span class="badge">${esc(v.dance_name)}</span>`:""}</div></div>`;
   d.addEventListener("click", e => {
     if (e.target.type === "checkbox") { toggleSel(v.id); }
     else { toggleSel(v.id); }
@@ -1423,7 +1633,7 @@ async function loadGroups(type) {
     g.members.forEach(m=>{
       const mm=document.createElement("div"); mm.className="member";
       const msrc = st.anim ? "/api/thumb_gif/" + m.id : "/api/thumb/" + m.id;
-      mm.innerHTML=`<img src="${msrc}" loading="lazy"><div class="mname ${m.status==="no_pose"?"np":""}">${esc(m.name)}</div>`;
+      mm.innerHTML=`<img src="${msrc}" loading="lazy"><div class="mname ${m.status==="no_pose"?"np":""}">${esc(m.name)}</div><div style="margin-top:3px">${funscriptBadge(m)}</div>`;
       mem.appendChild(mm);
     });
     div.appendChild(mem); el.appendChild(div);
