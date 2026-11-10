@@ -23,12 +23,12 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 # 特征算法版本：改动特征计算后 +1，老缓存会自动被标记重提取
 FEATURE_VERSION = 2
-# 模型是特征的一部分：切换模型 → 版本号变化 → 自动强制重新提取
-_MODEL_CODES = {"heavy": 0, "full": 1, "lite": 2}
 
 
-def _version_for(model: str) -> int:
-    return FEATURE_VERSION * 10 + _MODEL_CODES.get(model, 0)
+def _is_current_version(v) -> bool:
+    """特征版本是否当前。兼容旧的 2，以及曾把模型编码进版本的 20/21/22。"""
+    v = int(v or 0)
+    return v == FEATURE_VERSION or v // 10 == FEATURE_VERSION
 
 
 @dataclass
@@ -192,7 +192,7 @@ def index_video(
         rec.status = "error"
         rec.error = f"{type(exc).__name__}: {exc}"
 
-    store.set_status(vid, rec.status, rec.error, feature_version=_version_for(cfg.pose.model))
+    store.set_status(vid, rec.status, rec.error, feature_version=FEATURE_VERSION)
     return rec
 
 
@@ -389,7 +389,7 @@ def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None)
         pending = [
             r for r in store.all_videos()
             if r["status"] in ("pending", "error")
-            or (r["status"] in ("ok", "no_pose") and (r["feature_version"] or 0) != _version_for(cfg.pose.model))
+            or (r["status"] in ("ok", "no_pose") and not _is_current_version(r["feature_version"]))
         ]
         if only_ids is not None:
             idset = set(int(x) for x in only_ids)

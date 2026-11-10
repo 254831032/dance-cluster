@@ -132,6 +132,7 @@ def _thumb_dir() -> Path:
 _THUMB_FILES = {
     "thumb": "{id}.jpg",
     "gif": "{id}.gif",
+    "thumb_mp4": "{id}_thumb.mp4",
     "skel": "{id}_skel.png",
     "skel_gif": "{id}_skel.gif",
     "preview": "{id}_preview.mp4",
@@ -182,6 +183,12 @@ def _generate_thumb(video_id: int, kind: str, row: dict, out: Path) -> None:
     elif kind == "gif":
         dur = max(2.0, min(float(row["duration"] or 8.0), 6.0))
         ffmpeg.extract_gif(row["path"], out, at=0.0, duration=dur, fps=3, width=160)
+    elif kind == "thumb_mp4":
+        cfg = _cfg()
+        clip = cdir / "clip.mp4"
+        src = str(clip) if clip.exists() else row["path"]
+        dur = max(2.0, min(float(row["duration"] or 20.0), float(cfg.clip.duration or 20.0)))
+        ffmpeg.extract_mp4_thumb(src, out, at=0.0, duration=dur, fps=6, width=220)
     elif kind == "skel":
         pose_npz = cdir / "pose.npz"
         if pose_npz.exists():
@@ -235,7 +242,7 @@ def pre_generate_thumbs(ids) -> None:
     """提取完成后后台预热缩略图 / GIF / 骨架视频（不阻塞，复用同一套同步生成）。"""
     def _worker():
         for vid in ids:
-            for kind in ("thumb", "gif", "preview"):
+            for kind in ("thumb", "thumb_mp4"):
                 try:
                     _generate_thumb_sync(vid, kind)
                 except Exception:
@@ -470,6 +477,63 @@ def run():
     return jsonify({"ok": True})
 
 
+# ---------- 视频详情 ----------
+@app.get("/api/video_detail/<int:video_id>")
+def video_detail(video_id):
+    row = _get_row(video_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    try:
+        store = _store()
+    except RuntimeError:
+        return jsonify({"ok": False, "error": "请先设置缓存目录"}), 400
+    try:
+        music_names = store.group_names("music")
+        dance_names = store.group_names("dance")
+        cats = store.list_categories()
+        my_cat_ids = set(store.video_categories().get(int(video_id), []))
+        my_cats = [c["id"] for c in cats if c["id"] in my_cat_ids]
+    finally:
+        store.close()
+
+    # funscript 详情
+    fs_axes = []
+    try:
+        for axis, path in funscript.find_for(row["path"]):
+            info = funscript.parse(path)
+            fs_axes.append({
+                "axis": axis,
+                "path": str(path),
+                "count": info["count"],
+                "duration_ms": info["duration_ms"],
+                "speed": info["speed"],
+            })
+    except Exception:
+        pass
+
+    mg = row["music_group"]
+    dg = row["dance_group"]
+    return jsonify({
+        "ok": True,
+        "id": int(row["id"]),
+        "name": row["name"],
+        "path": row["path"],
+        "duration": round(float(row["duration"] or 0), 2),
+        "width": int(row["width"] or 0),
+        "height": int(row["height"] or 0),
+        "fps": round(float(row["fps"] or 0), 2),
+        "status": row["status"],
+        "tempo": round(float(row["tempo"] or 0), 1),
+        "confidence": round(float(row["confidence"]), 3) if row["confidence"] is not None else None,
+        "present_ratio": round(float(row["present_ratio"] or 0), 3),
+        "music_name": music_names.get(mg, f"M{mg}") if mg is not None else None,
+        "dance_name": dance_names.get(dg, f"D{dg}") if dg is not None else None,
+        "categories": [c["name"] for c in cats if c["id"] in my_cats],
+        "funscript_count": len(fs_axes),
+        "funscript_axes": fs_axes,
+    })
+
+
 # ---------- funscript ----------
 @app.post("/api/funscripts/scan")
 def funscripts_scan():
@@ -549,6 +613,46 @@ def thumb_gif(video_id):
     if out is None:
         return ("", 404)
     return send_file(out, mimetype="image/gif")
+
+
+@app.get("/api/pose/<int:video_id>")
+def pose_data(video_id):
+    row = _get_row(video_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    if not _ensure_cache(row):
+        return jsonify({"ok": False, "error": "缓存缺失"}), 404
+    npz = Path(row["cache_dir"]) / "pose.npz"
+    if not npz.exists():
+        return jsonify({"ok": False, "error": "无骨架数据"}), 404
+    import numpy as np
+
+    with np.load(npz) as d:
+        l2d = d["landmarks2d"]
+        vis = d["visibility"] if "visibility" in d else np.zeros(l2d.shape[:2], np.float32)
+        fps = float(d["fps"]) if d["fps"] is not None and d["fps"].size else 15.0
+    F = int(l2d.shape[0])
+    step = max(1, F // 900)
+    l2d = l2d[::step]
+    vis = vis[::step]
+    frames = [[[round(float(x), 3), round(float(y), 3)] for x, y in fr] for fr in l2d]
+    vis_out = [[round(float(v), 2) for v in fr] for fr in vis]
+    return jsonify({
+        "ok": True,
+        "fps": (fps / step) if step > 1 else fps,
+        "frames": len(frames),
+        "landmarks": frames,
+        "visibility": vis_out,
+        "aspect": (row["width"] / row["height"]) if (row["width"] and row["height"]) else 0.75,
+    })
+
+
+@app.get("/api/thumb_mp4/<int:video_id>")
+def thumb_mp4(video_id):
+    out = _generate_thumb_sync(video_id, "thumb_mp4")
+    if out is None:
+        return ("", 404)
+    return send_file(out, conditional=True, mimetype="video/mp4")
 
 
 @app.get("/api/preview/<int:video_id>")
@@ -967,7 +1071,7 @@ INDEX_HTML = r"""<!doctype html>
   .card { position:relative; background:#10141c; border:1px solid var(--line); border-radius:10px; overflow:hidden; cursor:pointer; }
   .card.sel { border-color:var(--accent); box-shadow:0 0 0 2px rgba(91,140,255,.4); }
   .card img { width:100%; aspect-ratio:16/9; object-fit:cover; display:block; background:#0a0d12; }
-  .card .ck { position:absolute; top:6px; left:6px; }
+  .card .ck { position:absolute; top:6px; right:6px; z-index:2; width:16px; height:16px; }
   .card .meta { padding:8px 9px; }
   .card .name { font-size:12px; word-break:break-all; }
   .card .badges { margin-top:4px; display:flex; gap:4px; flex-wrap:wrap; }
@@ -976,7 +1080,7 @@ INDEX_HTML = r"""<!doctype html>
   .badge.fs-none { color:var(--dim); }
   .badge.fs-single { color:#7aa2ff; border:1px solid #2c4166; }
   .badge.fs-multi { color:var(--ok); border:1px solid #2a4a3a; }
-  .pv canvas { width:100%; height:120px; background:#0c0f15; border-radius:8px; display:block; }
+  #pv-fs-canvas { width:100%; height:120px; background:#0c0f15; border-radius:8px; display:block; }
   .badge.done { color:var(--ok); }
   .badge.extracting { color:var(--warn); }
   .thumb-sm { width:64px; height:36px; object-fit:cover; border-radius:4px; vertical-align:middle; background:#0a0d12; }
@@ -984,15 +1088,22 @@ INDEX_HTML = r"""<!doctype html>
   .group-head { display:flex; align-items:center; gap:10px; }
   .group-head .tag { background:var(--accent); color:#fff; border-radius:6px; padding:2px 8px; font-size:12px; }
   .group-head input[type=text] { flex:0 1 320px; }
-  .members { margin-top:12px; display:flex; flex-wrap:wrap; gap:12px; }
+  .members { flex:1; min-width:0; display:flex; flex-wrap:wrap; gap:12px; align-content:flex-start; }
   .member { width:120px; }
   .member img { width:100%; aspect-ratio:16/9; object-fit:cover; border-radius:6px; background:#0a0d12; }
   .member .mname { font-size:11px; color:var(--dim); word-break:break-all; }
   .member .np { color:var(--bad); }
-  .group-preview { margin:10px 0; }
-  .group-preview .skel { width:230px; max-height:330px; object-fit:contain; border-radius:8px; background:#000; display:block; }
+  .group-body { display:flex; gap:16px; align-items:flex-start; margin-top:12px; }
+  .group-preview { position:relative; flex:0 0 208px; width:208px; height:144px; border-radius:10px; overflow:hidden; cursor:pointer; background:#0a0d12; border:1px solid var(--line); }
+  .group-preview img { width:100%; height:100%; object-fit:cover; display:block; }
+  .group-preview:hover { border-color:var(--accent); }
+  .group-preview .pv-tag { position:absolute; left:6px; top:6px; font-size:11px; color:#dfe6f5; background:rgba(0,0,0,.55); border-radius:5px; padding:1px 6px; }
+  .group-preview .play { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:13px; color:#fff; background:rgba(0,0,0,.38); transition:background .15s; }
+  .group-preview:hover .play { background:rgba(0,0,0,.6); }
   .empty { color:var(--dim); padding:30px 0; text-align:center; }
   .settings-box { max-width:560px; margin:30px auto 0; }
+  .path-box { flex:1; background:#0c0f15; border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:13px; color:var(--dim); word-break:break-all; min-height:38px; }
+  .path-box.set { color:var(--text); border-color:#33405a; }
   .modal { position:fixed; inset:0; background:rgba(0,0,0,.62); display:flex; align-items:center; justify-content:center; z-index:100; }
   .modal-box { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; width:min(760px, 94vw); max-height:90vh; overflow:auto; }
   .modal-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
@@ -1007,6 +1118,29 @@ INDEX_HTML = r"""<!doctype html>
   .msel-panel.open { display:block; }
   .msel-panel label { display:flex; gap:7px; align-items:center; padding:4px 8px; cursor:pointer; font-size:13px; border-radius:6px; }
   .msel-panel label:hover { background:#1c222d; }
+  #detail-modal { z-index: 110; }
+  #preview-modal { z-index: 120; }
+  .detail-box { width:min(880px, 94vw); }
+  .detail-body { display:flex; gap:16px; align-items:flex-start; }
+  .detail-thumb { width:300px; max-height:220px; object-fit:contain; border-radius:10px; background:#000; flex-shrink:0; }
+  .detail-info { flex:1; font-size:13px; min-width:0; }
+  .di-row { display:flex; gap:10px; padding:5px 0; border-bottom:1px dashed #1e2430; }
+  .di-row span { color:var(--dim); width:62px; flex-shrink:0; }
+  .di-row b { font-weight:500; word-break:break-all; }
+  .card .name { cursor:pointer; }
+  .card .name:hover { color:#8fb0ff; text-decoration:underline; }
+  #play-modal { z-index: 130; }
+  .thumb-wrap { position:relative; }
+  .thumb-wrap .thumb-media { width:100%; aspect-ratio:16/9; object-fit:cover; display:block; background:#0a0d12; border-radius:6px; }
+  .hover-btns { position:absolute; left:0; right:0; bottom:0; display:flex; gap:4px; padding:6px; background:linear-gradient(transparent, rgba(0,0,0,.75)); opacity:0; transition:opacity .15s; }
+  .thumb-wrap:hover .hover-btns, .group-preview:hover .hover-btns { opacity:1; }
+  .hover-btns button { padding:3px 9px; font-size:11px; border-radius:6px; background:rgba(30,36,48,.92); color:#fff; border:1px solid rgba(255,255,255,.16); cursor:pointer; line-height:1.4; }
+  .hover-btns button:hover { background:var(--accent); border-color:var(--accent); }
+  .skel-stage { position:relative; background:#000; border-radius:8px; overflow:hidden; margin:0 auto; }
+  .skel-stage video { width:100%; height:100%; object-fit:contain; display:block; max-height:none; }
+  .skel-stage canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1; }
+  .list-name { cursor:pointer; }
+  .list-name:hover { color:#8fb0ff; text-decoration:underline; }
 </style>
 </head>
 <body>
@@ -1032,7 +1166,7 @@ INDEX_HTML = r"""<!doctype html>
         <h2>设置</h2>
         <p class="sub">缓存目录用于存放数据库和中间文件，<b>必须设置</b>。</p>
         <div class="row">
-          <input id="cache-dir" type="text" placeholder="例如 D:\\DanceCluster\\cache" style="flex:1">
+          <div id="cache-dir" class="path-box">未选择缓存目录</div>
           <button id="btn-pick-cache" class="ghost">选择…</button>
           <button id="btn-default-cache" class="ghost">使用默认目录</button>
           <button id="btn-save-cache">保存并启用</button>
@@ -1042,7 +1176,7 @@ INDEX_HTML = r"""<!doctype html>
           <label for="pose-model" style="margin-right:10px; white-space:nowrap">MediaPipe 模型</label>
           <select id="pose-model" style="flex:1"></select>
         </div>
-        <p class="muted">模型决定骨架精度与速度：Heavy 最准但慢、Full 均衡、Lite 最快但精度低。切换后，已完成的视频会在下次运行时自动重新提取。</p>
+        <p class="muted">模型决定骨架精度与速度：Heavy 最准但慢、Full 均衡、Lite 最快但精度低。切换只影响之后新提取的视频，已完成的不会重新提取。</p>
         <div class="row" style="margin-top:18px; padding-top:14px; border-top:1px solid var(--line)">
           <button id="btn-clear" class="ghost" style="color:var(--bad)">清除全部数据（重新开始）</button>
         </div>
@@ -1150,10 +1284,17 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal-box">
     <div class="modal-head"><b id="preview-name"></b><button class="ghost small" id="preview-close">✕ 关闭</button></div>
     <div class="modal-body">
-      <div class="pv"><div class="pv-title">原视频</div><video id="pv-video" controls playsinline></video></div>
-      <div class="pv"><div class="pv-title">动作片段（前 20 秒）</div><video id="pv-clip" controls playsinline></video></div>
-      <div class="pv"><div class="pv-title">提取的音频</div><audio id="pv-audio" controls></audio></div>
-      <div class="pv" id="pv-fs-wrap" style="display:none">
+      <div class="pv">
+        <div class="pv-title">骨架动作预览（叠加在片段上，带声音）</div>
+        <div class="skel-stage">
+          <video id="skel-video" controls playsinline preload="auto"></video>
+          <canvas id="skel-canvas"></canvas>
+        </div>
+      </div>
+      <div class="pv pv-other"><div class="pv-title">原视频</div><video id="pv-video" controls playsinline></video></div>
+      <div class="pv pv-other"><div class="pv-title">动作片段（前 20 秒）</div><video id="pv-clip" controls playsinline></video></div>
+      <div class="pv pv-other"><div class="pv-title">提取的音频</div><audio id="pv-audio" controls></audio></div>
+      <div class="pv pv-other" id="pv-fs-wrap" style="display:none">
         <div class="pv-title" id="pv-fs-title">Funscript 动作曲线</div>
         <canvas id="pv-fs-canvas" height="120"></canvas>
       </div>
@@ -1161,17 +1302,55 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<div class="modal" id="detail-modal" style="display:none">
+  <div class="modal-box detail-box">
+    <div class="modal-head"><b id="detail-name"></b><button class="ghost small" id="detail-close">✕ 关闭</button></div>
+    <div class="detail-body">
+      <video id="detail-video" class="detail-thumb" controls playsinline preload="metadata"></video>
+      <div class="detail-info" id="detail-info"></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="detail-preview">预览</button>
+      <button id="detail-reextract" class="ghost">重新提取</button>
+      <button id="detail-delete" class="ghost" style="color:var(--bad)">删除</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="play-modal" style="display:none">
+  <div class="modal-box">
+    <div class="modal-head"><b id="play-name"></b><button class="ghost small" id="play-close">✕ 关闭</button></div>
+    <video id="play-video" controls playsinline style="width:100%;max-height:72vh;background:#000;border-radius:8px"></video>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
-const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), selTask:new Set(), search:"", fMusic:new Set(), fDance:new Set(), fsLevel:"all", fsAxes:[], fsMaxAt:1 };
+const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), selTask:new Set(), search:"", fMusic:new Set(), fDance:new Set(), fsLevel:"all", fsAxes:[], fsMaxAt:1, cacheDir:"", detailId:null };
 
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 async function post(path, body) { return api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})}); }
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+const _thumbObs = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    const v = e.target;
+    if (e.isIntersecting) {
+      if (!v.getAttribute("src")) v.src = v.dataset.src;
+      v.play().catch(() => {});
+    } else {
+      v.pause();
+    }
+  }
+}, { rootMargin: "300px" });
+function observeThumb(v) { if (v) _thumbObs.observe(v); }
 function statusBadge(s) {
   const m = {ok:["done","已完成"], no_pose:["np","无骨架"], extracting:["extracting","提取中"], pending:["","待处理"], error:["np","出错"]}[s]||["",""];
   return `<span class="badge ${m[0]}">${m[1]||s}</span>`;
+}
+function confirm2(first, second) {
+  if (!confirm(first)) return false;
+  return confirm(second);
 }
 function funscriptBadge(v) {
   const n = v.funscript_count || 0;
@@ -1203,17 +1382,20 @@ function switchView(name) {
 
 // ---- 设置 ----
 document.getElementById("btn-save-cache").addEventListener("click", async () => {
-  const r = await post("/api/config/set", {cache_dir: $("#cache-dir").value, model: $("#pose-model").value});
+  if (!st.cacheDir) { $("#cache-hint").textContent = "请先选择缓存目录"; $("#cache-hint").style.color="var(--bad)"; return; }
+  const r = await post("/api/config/set", {cache_dir: st.cacheDir, model: $("#pose-model").value});
   if (!r.ok) { $("#cache-hint").textContent = "✗ " + (r.error||"失败"); $("#cache-hint").style.color="var(--bad)"; return; }
   $("#cache-hint").textContent = "✓ 已启用：" + r.cache_dir; $("#cache-hint").style.color="var(--ok)";
   await refreshConfig(); switchView("task");
 });
 document.getElementById("btn-pick-cache").addEventListener("click", async () => {
   const r = await post("/api/pick_folder", {});
-  if (r.ok) $("#cache-dir").value = r.path; else if (r.error!=="已取消") alert(r.error);
+  if (r.ok) { st.cacheDir = r.path; $("#cache-dir").textContent = r.path; $("#cache-dir").classList.add("set"); }
+  else if (r.error !== "已取消") alert(r.error);
 });
 document.getElementById("btn-default-cache").addEventListener("click", async () => {
-  const c = await api("/api/config"); if (c.suggested) $("#cache-dir").value = c.suggested;
+  const c = await api("/api/config");
+  if (c.suggested) { st.cacheDir = c.suggested; $("#cache-dir").textContent = c.suggested; $("#cache-dir").classList.add("set"); }
 });
 document.getElementById("btn-clear").addEventListener("click", async () => {
   if (!confirm("确定清除所有数据吗？将删除数据库、缓存、缩略图（不影响源视频和缓存目录设置）。")) return;
@@ -1223,7 +1405,10 @@ document.getElementById("btn-clear").addEventListener("click", async () => {
 });
 async function refreshConfig() {
   const c = await api("/api/config");
-  st.configured = c.configured; $("#cache-dir").value = c.cache_dir||"";
+  st.configured = c.configured;
+  st.cacheDir = c.cache_dir || "";
+  $("#cache-dir").textContent = st.cacheDir || "未选择缓存目录";
+  $("#cache-dir").classList.toggle("set", !!st.cacheDir);
   const sel = $("#pose-model");
   sel.innerHTML = "";
   (c.models||[]).forEach(m => {
@@ -1360,12 +1545,16 @@ function syncSizeBtns() {
 
 document.getElementById("btn-reextract").addEventListener("click", async () => {
   if (!st.sel.size) { alert("请先勾选视频"); return; }
+  const n = st.sel.size;
+  if (!confirm2(`重新提取选中的 ${n} 个视频？（会清空它们的提取结果，需要重跑）`,
+                "再次确认：确定重新提取？")) return;
   const r = await post("/api/videos/reextract", {ids:[...st.sel]});
   if (r.ok) { alert("已标记重新提取，请到「识别任务」点开始提取"); st.sel.clear(); refreshLibrary(); }
 });
 document.getElementById("btn-delete").addEventListener("click", async () => {
   if (!st.sel.size) { alert("请先勾选视频"); return; }
-  if (!confirm(`从库里删除选中的 ${st.sel.size} 个视频？（不会删除源文件）`)) return;
+  if (!confirm2(`从库里删除选中的 ${st.sel.size} 个视频？（不会删除源文件）`,
+                "再次确认：确定删除？缓存和缩略图也会一并清理。")) return;
   const r = await post("/api/videos/delete", {ids:[...st.sel]});
   if (r.ok) { st.sel.clear(); refreshLibrary(); }
 });
@@ -1385,15 +1574,192 @@ document.getElementById("btn-scan-fs").addEventListener("click", async () => {
 });
 document.getElementById("btn-preview").addEventListener("click", () => {
   if (st.sel.size !== 1) { alert("请先选中一个视频（单选）进行预览"); return; }
-  const id = [...st.sel][0];
-  const v = st.videos.find(x => x.id === id);
-  if (!v) return;
-  $("#preview-name").textContent = v.name;
-  $("#pv-video").src = "/api/video/" + id;
-  $("#pv-clip").src = "/api/clip/" + id;
-  $("#pv-audio").src = "/api/audio/" + id;
+  openPreview([...st.sel][0]);
+});
+async function openPreview(id, name, onlySkel) {
+  let title = name || (st.videos.find(x => x.id === id) || {}).name;
+  if (!title) {
+    const d = await api("/api/video_detail/" + id);
+    title = d && d.ok ? d.name : ("#" + id);
+  }
+  $("#preview-name").textContent = title;
+  document.querySelectorAll("#preview-modal .pv-other").forEach(el => {
+    el.style.display = onlySkel ? "none" : "";
+  });
   $("#preview-modal").style.display = "flex";
-  loadPreviewFunscript(id);
+  if (onlySkel) {
+    $("#pv-video").removeAttribute("src");
+    $("#pv-clip").removeAttribute("src");
+    $("#pv-audio").removeAttribute("src");
+    $("#pv-fs-wrap").style.display = "none";
+  } else {
+    $("#pv-video").src = "/api/video/" + id;
+    $("#pv-clip").src = "/api/clip/" + id;
+    $("#pv-audio").src = "/api/audio/" + id;
+    loadPreviewFunscript(id);
+  }
+  await loadSkelPlayer(id);
+}
+
+// ---- 单视频快速播放 ----
+const PLAY_SRC = { orig: "/api/video/", skel: "/api/preview/", clip: "/api/clip/" };
+const PLAY_LABEL = { orig: "原片", skel: "骨架视频", clip: "片段视频" };
+function playOne(id, kind, name) {
+  const base = PLAY_SRC[kind] || PLAY_SRC.orig;
+  $("#play-name").textContent = (PLAY_LABEL[kind] || "") + " · " + (name || ("#" + id));
+  $("#play-video").src = base + id;
+  $("#play-modal").style.display = "flex";
+}
+function closePlay() {
+  const v = $("#play-video");
+  try { v.pause(); } catch (e) {}
+  $("#play-modal").style.display = "none";
+}
+document.getElementById("play-close").addEventListener("click", closePlay);
+document.getElementById("play-modal").addEventListener("click", e => {
+  if (e.target.id === "play-modal") closePlay();
+});
+
+// ---- 骨架叠加播放器（视频 + 骨架 + 声音）----
+const POSE_CONN = [[0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
+  [11,12],[11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
+  [12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
+  [11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],
+  [27,29],[28,30],[29,31],[30,32],[27,31],[28,32]];
+const skel = { data: null, fps: 15, raf: null };
+
+async function loadSkelPlayer(id) {
+  stopSkel();
+  const v = $("#skel-video");
+  if (!v) return;
+  skel.data = null;
+  const d = await api("/api/pose/" + id);
+  skel.data = (d.ok && d.landmarks && d.landmarks.length) ? d : null;
+  skel.fps = d.fps || 15;
+  // 舞台按视频宽高比自适应，避免画面被压成中间一条
+  const stage = document.querySelector(".skel-stage");
+  if (stage) {
+    const asp = d.aspect || 0.75;
+    const H = 420;
+    stage.style.height = H + "px";
+    stage.style.width = Math.round(H * asp) + "px";
+  }
+  v.poster = "/api/thumb/" + id;
+  v.src = "/api/clip/" + id;
+  v.load();
+  v.onloadedmetadata = () => { try { v.currentTime = 0.05; } catch (e) {} };
+  drawSkelAt(0);
+  skel.raf = requestAnimationFrame(skelLoop);
+}
+
+function drawSkelAt(t) {
+  const v = $("#skel-video");
+  const cv = $("#skel-canvas");
+  const d = skel.data;
+  if (!v || !cv || !d) return;
+  const W = v.clientWidth || 0;
+  const H = v.clientHeight || 0;
+  if (!W || !H) return;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, W, H);
+  // object-fit: contain 时视频内容在元素内是 letterbox 的，骨架要映射到这个区域
+  const vw = v.videoWidth || 0, vh = v.videoHeight || 0;
+  let rx = 0, ry = 0, rw = W, rh = H;
+  if (vw && vh) {
+    const scale = Math.min(W / vw, H / vh);
+    rw = vw * scale; rh = vh * scale;
+    rx = (W - rw) / 2; ry = (H - rh) / 2;
+  }
+  const fps = skel.fps || 15;
+  let idx = Math.floor((t || 0) * fps);
+  if (idx < 0) idx = 0;
+  if (idx >= d.frames) idx = d.frames - 1;
+  const fr = d.landmarks[idx] || [];
+  ctx.strokeStyle = "#5b8cff"; ctx.lineWidth = 2;
+  for (const ab of POSE_CONN) {
+    const a = fr[ab[0]], b = fr[ab[1]];
+    if (!a || !b) continue;
+    ctx.beginPath();
+    ctx.moveTo(rx + a[0]*rw, ry + a[1]*rh);
+    ctx.lineTo(rx + b[0]*rw, ry + b[1]*rh);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#ffd166";
+  for (const p of fr) {
+    if (!p) continue;
+    ctx.beginPath(); ctx.arc(rx + p[0]*rw, ry + p[1]*rh, 2.2, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+function skelLoop() {
+  const v = $("#skel-video");
+  if (!v) return;
+  drawSkelAt(v.currentTime);
+  skel.raf = requestAnimationFrame(skelLoop);
+}
+
+function stopSkel() {
+  if (skel.raf) { cancelAnimationFrame(skel.raf); skel.raf = null; }
+  const v = $("#skel-video");
+  if (v) { try { v.pause(); } catch (e) {} }
+}
+
+// ---- 源文件详情 ----
+async function showDetail(id) {
+  const d = await api("/api/video_detail/" + id);
+  if (!d.ok) { alert(d.error || "获取详情失败"); return; }
+  st.detailId = id;
+  $("#detail-name").textContent = d.name;
+  $("#detail-video").src = "/api/video/" + id;
+  const fsLines = (d.funscript_axes || []).map(a =>
+    `<div class="di-row"><span>${esc(a.axis)}</span><b>${a.count} 个动作 · ${(a.duration_ms/1000).toFixed(1)}s · 速度 ${a.speed}</b></div>`
+  ).join("");
+  $("#detail-info").innerHTML = `
+    <div class="di-row"><span>路径</span><b>${esc(d.path)}</b></div>
+    <div class="di-row"><span>分辨率</span><b>${d.width}×${d.height} @ ${d.fps}fps</b></div>
+    <div class="di-row"><span>时长</span><b>${d.duration}s</b></div>
+    <div class="di-row"><span>状态</span><b>${statusBadge(d.status)}</b></div>
+    <div class="di-row"><span>音乐组</span><b>${esc(d.music_name || "-")}</b></div>
+    <div class="di-row"><span>动作组</span><b>${esc(d.dance_name || "-")}</b></div>
+    <div class="di-row"><span>BPM</span><b>${d.tempo || "-"}</b></div>
+    <div class="di-row"><span>置信度</span><b>${d.confidence != null ? d.confidence : "-"}</b></div>
+    <div class="di-row"><span>分类</span><b>${(d.categories||[]).map(esc).join("、") || "-"}</b></div>
+    <div class="di-row"><span>脚本</span><b>${d.funscript_count ? d.funscript_count + " 轴" : "无"}</b></div>
+    ${fsLines}`;
+  $("#detail-modal").style.display = "flex";
+}
+function closeDetail() {
+  const v = $("#detail-video");
+  try { v.pause(); } catch (e) {}
+  $("#detail-modal").style.display = "none";
+}
+document.getElementById("detail-close").addEventListener("click", closeDetail);
+document.getElementById("detail-modal").addEventListener("click", e => {
+  if (e.target.id === "detail-modal") closeDetail();
+});
+document.getElementById("detail-preview").addEventListener("click", () => {
+  if (st.detailId != null) {
+    try { $("#detail-video").pause(); } catch (e) {}
+    openPreview(st.detailId, null, true);
+  }
+});
+document.getElementById("detail-reextract").addEventListener("click", async () => {
+  if (st.detailId == null) return;
+  if (!confirm2("重新提取这个视频？（会清空它的提取结果）", "再次确认：确定重新提取？")) return;
+  const r = await post("/api/videos/reextract", {ids:[st.detailId]});
+  if (!r.ok) { alert(r.error||"失败"); return; }
+  $("#detail-modal").style.display = "none";
+  refreshLibrary();
+});
+document.getElementById("detail-delete").addEventListener("click", async () => {
+  if (st.detailId == null) return;
+  if (!confirm2("删除这个视频（含缓存/缩略图，不影响源文件）？", "再次确认：确定删除？")) return;
+  const r = await post("/api/videos/delete", {ids:[st.detailId]});
+  if (!r.ok) { alert(r.error||"失败"); return; }
+  $("#detail-modal").style.display = "none";
+  st.sel.delete(st.detailId);
+  refreshLibrary();
 });
 
 async function loadPreviewFunscript(videoId) {
@@ -1439,12 +1805,14 @@ $("#pv-video").addEventListener("timeupdate", e => {
 });
 document.getElementById("preview-close").addEventListener("click", () => {
   $("#preview-modal").style.display = "none";
+  stopSkel();
   $("#pv-video").pause(); $("#pv-clip").pause(); $("#pv-audio").pause();
 });
 document.getElementById("preview-modal").addEventListener("click", e => {
   if (e.target.id === "preview-modal") {
     $("#preview-modal").style.display = "none";
-    $("#pv-video").pause(); $("#pv-clip").pause(); $("#pv-audio").pause();
+    stopSkel();
+  $("#pv-video").pause(); $("#pv-clip").pause(); $("#pv-audio").pause();
   }
 });
 document.getElementById("check-all").addEventListener("change", e => {
@@ -1558,6 +1926,10 @@ function renderVideos() {
   const el = $("#video-list");
   if (st.view === "grid") { el.className="grid size-"+st.thumbSize; el.innerHTML=""; list.forEach(v=>el.appendChild(gridCard(v))); }
   else { el.className=""; el.innerHTML=""; el.appendChild(listTable(list)); }
+  updateSelUI();
+}
+function updateSelUI() {
+  const list = filteredVideos();
   $("#check-all").checked = list.length>0 && list.every(v=>st.sel.has(v.id));
   $("#sel-info").textContent = st.sel.size ? `已选 ${st.sel.size} 个` : "未选择";
 }
@@ -1577,15 +1949,27 @@ function listTable(list) {
     const checked = st.sel.has(v.id) ? "checked":"";
     tr.innerHTML = `<td><input type="checkbox" data-cb ${checked}></td>
       <td><img class="thumb-sm" src="/api/thumb/${v.id}"></td>
-      <td>${esc(v.name)}</td><td>${v.duration}s</td>
+      <td><span class="list-name">${esc(v.name)}</span></td><td>${v.duration}s</td>
       <td>${v.music_name||"-"}</td>
       <td>${v.dance_name||"-"}</td>
       <td>${funscriptBadge(v)}</td>
       <td>${statusBadge(v.status)}</td>`;
     tr.addEventListener("click", e => {
-      if (e.target.dataset.cb === "") { toggleSel(v.id); }
-      else { toggleSel(v.id); }
-      renderVideos();
+      if (e.target.dataset.cb === "") {
+        toggleSel(v.id);
+        tr.classList.toggle("sel", st.sel.has(v.id));
+        updateSelUI();
+        return;
+      }
+      if (e.target.tagName === "IMG" || e.target.classList.contains("list-name")) {
+        showDetail(v.id);
+        return;
+      }
+      toggleSel(v.id);
+      tr.classList.toggle("sel", st.sel.has(v.id));
+      const cb = tr.querySelector("input[data-cb]");
+      if (cb) cb.checked = st.sel.has(v.id);
+      updateSelUI();
     });
     tb.appendChild(tr);
   });
@@ -1597,14 +1981,41 @@ function gridCard(v) {
   d.className = "card" + (st.sel.has(v.id) ? " sel":"");
   d.dataset.id = v.id;
   const checked = st.sel.has(v.id) ? "checked":"";
-  const src = st.anim ? "/api/thumb_gif/"+v.id : "/api/thumb/"+v.id;
-  d.innerHTML = `<input type="checkbox" class="ck" ${checked}><img src="${src}" loading="lazy">
+  const media = st.anim
+    ? `<video class="thumb-media" loop muted playsinline preload="none" poster="/api/thumb/${v.id}" data-src="/api/thumb_mp4/${v.id}"></video>`
+    : `<img class="thumb-media" src="/api/thumb/${v.id}" loading="lazy">`;
+  d.innerHTML = `<input type="checkbox" class="ck" ${checked}>
+    <div class="thumb-wrap">
+      ${media}
+      <div class="hover-btns"><button data-kind="orig">原片</button><button data-kind="skel">骨架</button><button data-kind="clip">片段</button></div>
+    </div>
     <div class="meta"><div class="name">${esc(v.name)}</div>
     <div class="badges">${statusBadge(v.status)}${funscriptBadge(v)}${v.music_name?`<span class="badge">${esc(v.music_name)}</span>`:""}${v.dance_name?`<span class="badge">${esc(v.dance_name)}</span>`:""}</div></div>`;
+  d.querySelector(".hover-btns").addEventListener("click", e => {
+    e.stopPropagation();
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    if (btn.dataset.kind === "skel") { openPreview(v.id, v.name, true); return; }
+    playOne(v.id, btn.dataset.kind, v.name);
+  });
+  observeThumb(d.querySelector("video.thumb-media"));
   d.addEventListener("click", e => {
-    if (e.target.type === "checkbox") { toggleSel(v.id); }
-    else { toggleSel(v.id); }
-    renderVideos();
+    if (e.target.classList.contains("ck")) {
+      toggleSel(v.id);
+      d.classList.toggle("sel", st.sel.has(v.id));
+      e.target.checked = st.sel.has(v.id);
+      updateSelUI();
+      return;
+    }
+    if (e.target.tagName === "IMG" || e.target.tagName === "VIDEO" || e.target.classList.contains("name")) {
+      showDetail(v.id);
+      return;
+    }
+    toggleSel(v.id);
+    d.classList.toggle("sel", st.sel.has(v.id));
+    const cb = d.querySelector(".ck");
+    if (cb) cb.checked = st.sel.has(v.id);
+    updateSelUI();
   });
   return d;
 }
@@ -1623,20 +2034,42 @@ async function loadGroups(type) {
     head.appendChild(inp);
     const cnt=document.createElement("span"); cnt.className="muted"; cnt.textContent=g.members.length+" 个"; head.appendChild(cnt);
     div.appendChild(head);
+    const body = document.createElement("div"); body.className = "group-body";
     const rep = g.members[0];
     if (rep) {
       const pv = document.createElement("div"); pv.className = "group-preview";
-      pv.innerHTML = `<video class="skel" controls preload="metadata" src="/api/preview/${rep.id}"></video>`;
-      div.appendChild(pv);
+      pv.title = "点击预览：" + rep.name;
+      pv.innerHTML = `<img src="/api/thumb/${rep.id}" loading="lazy">
+        <div class="hover-btns"><button data-kind="orig">原片</button><button data-kind="skel">骨架</button><button data-kind="clip">片段</button></div>`;
+      pv.addEventListener("click", () => openPreview(rep.id, rep.name));
+      pv.querySelector(".hover-btns").addEventListener("click", e => {
+        e.stopPropagation();
+        const btn = e.target.closest("button");
+        if (!btn) return;
+        if (btn.dataset.kind === "skel") { openPreview(rep.id, rep.name, true); return; }
+        playOne(rep.id, btn.dataset.kind, rep.name);
+      });
+      body.appendChild(pv);
     }
     const mem=document.createElement("div"); mem.className="members";
     g.members.forEach(m=>{
       const mm=document.createElement("div"); mm.className="member";
-      const msrc = st.anim ? "/api/thumb_gif/" + m.id : "/api/thumb/" + m.id;
-      mm.innerHTML=`<img src="${msrc}" loading="lazy"><div class="mname ${m.status==="no_pose"?"np":""}">${esc(m.name)}</div><div style="margin-top:3px">${funscriptBadge(m)}</div>`;
+      const mmedia = st.anim
+        ? `<video class="thumb-media" loop muted playsinline preload="none" poster="/api/thumb/${m.id}" data-src="/api/thumb_mp4/${m.id}"></video>`
+        : `<img class="thumb-media" src="/api/thumb/${m.id}" loading="lazy">`;
+      mm.innerHTML=`<div class="thumb-wrap">${mmedia}<div class="hover-btns"><button data-kind="orig">原片</button><button data-kind="skel">骨架</button><button data-kind="clip">片段</button></div></div><div class="mname ${m.status==="no_pose"?"np":""}">${esc(m.name)}</div><div style="margin-top:3px">${funscriptBadge(m)}</div>`;
+      mm.querySelector(".hover-btns").addEventListener("click", e => {
+        e.stopPropagation();
+        const btn = e.target.closest("button");
+        if (!btn) return;
+        if (btn.dataset.kind === "skel") { openPreview(m.id, m.name, true); return; }
+        playOne(m.id, btn.dataset.kind, m.name);
+      });
+      observeThumb(mm.querySelector("video.thumb-media"));
       mem.appendChild(mm);
     });
-    div.appendChild(mem); el.appendChild(div);
+    body.appendChild(mem);
+    div.appendChild(body); el.appendChild(div);
   });
 }
 

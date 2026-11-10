@@ -107,13 +107,14 @@ def cut_clip(
             cmd += ["-vf", f"scale=-2:{max_height}"]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", str(out),
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out),
         ]
     else:
         cmd = [
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
-            "-c", "copy", "-avoid_negative_ts", "make_zero", str(out),
+            "-c", "copy", "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart", str(out),
         ]
     _run(cmd)
     return out
@@ -214,3 +215,25 @@ def to_aac(src: str | Path, dst: str | Path, bitrate: str = "96k") -> Path:
         "-i", str(src), "-vn", "-c:a", "aac", "-b:a", bitrate, str(dst),
     ])
     return dst
+
+
+def extract_mp4_thumb(
+    video: str | Path,
+    out: str | Path,
+    at: float = 1.0,
+    duration: float = 3.0,
+    fps: int = 8,
+    width: int = 240,
+) -> Path:
+    """抽一小段做成无声循环 mp4 动图缩略图（比 GIF 小很多、加载更快）。"""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    vf = f"fps={int(fps)},scale={int(width)}:-2:flags=lanczos"
+    cmd = [
+        ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{at:.2f}", "-t", f"{duration:.2f}", "-i", str(video),
+        "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
+    ]
+    _run(cmd)
+    return out
