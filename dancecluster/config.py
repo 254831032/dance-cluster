@@ -176,3 +176,42 @@ class AppConfig:
             if k in raw:
                 setattr(cfg, k, raw[k])
         return cfg
+
+
+# ---------- 缓存目录安全校验 ----------
+# 清空缓存（clear_all）会删除 cache_dir 下的所有内容。为防「一定不能删源码/脚本」
+# 这条底线被误配置击穿，这里统一做硬性保护：源码目录及项目根的上级一律拒绝。
+
+
+def is_protected_source_dir(p: Path | str) -> bool:
+    """p 是否包含程序自身的源码/脚本，不能被当作缓存目录（更不可被清空）。
+
+    命中任一即视为受保护：
+      * p 解析后等于项目根 PROJECT_ROOT；
+      * 项目根位于 p 之下（即 p 是项目根的上级目录）；
+      * p 明显是源码目录（同时含 app.py 与 dancecluster/ 子目录）。
+    """
+    try:
+        resolved = Path(p).resolve()
+    except Exception:
+        return True  # 解析失败也按受保护处理，宁可拒绝
+    root = PROJECT_ROOT.resolve()
+    if resolved == root:
+        return True
+    try:
+        root.relative_to(resolved)
+        return True
+    except ValueError:
+        pass
+    return (resolved / "app.py").is_file() and (resolved / "dancecluster").is_dir()
+
+
+def assert_safe_cache_dir(p: Path | str) -> Path:
+    """校验缓存目录安全；不安全则抛 ValueError。返回解析后的路径。"""
+    resolved = Path(p).resolve()
+    if is_protected_source_dir(resolved):
+        raise ValueError(
+            f"拒绝操作：{resolved} 包含程序源码/脚本（或位于项目目录之上），"
+            "不能设为缓存目录，也不会清空这里的任何文件。请选择一个独立的缓存文件夹。"
+        )
+    return resolved

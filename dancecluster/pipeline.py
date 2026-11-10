@@ -16,13 +16,14 @@ from pathlib import Path
 import numpy as np
 
 from . import audio, clustering, dtw, features, ffmpeg, funscript, pose
-from .config import AppConfig
+from .config import AppConfig, assert_safe_cache_dir
 from .db import Store
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 # 特征算法版本：改动特征计算后 +1，老缓存会自动被标记重提取
-FEATURE_VERSION = 2
+# v3：补上 chromaprint 指纹（此前 fpcalc 未打包，指纹为空导致音频匹配退化为纯 chroma）
+FEATURE_VERSION = 3
 
 
 def _is_current_version(v) -> bool:
@@ -308,46 +309,58 @@ def scan_funscripts(ids: list[int], cfg: AppConfig) -> dict:
         store.close()
 
 
-def _discover(folders: list, cfg: AppConfig, store: Store) -> dict:
-    """把文件夹里的视频登记为 pending（只登记，不提取）。返回统计。"""
+def _discover(folders: list, cfg: AppConfig, store: Store, progress=None) -> dict:
+    """把文件夹里的视频登记为 pending（只登记，不提取）。返回统计。
+
+    progress(i, total, name, stage) 可选：大文件夹扫描时上报进度，避免界面卡死无反馈。
+    重复文件（path 已存在）不会重复登记。
+    """
     stats = {"scanned": 0, "added": 0, "already": 0}
+    all_paths: list[Path] = []
     for folder in folders:
-        for p in list_videos(folder):
-            stats["scanned"] += 1
-            row = store.get_by_path(str(p))
-            if row is None:
-                info = ffmpeg.probe(p)
-                store.upsert_video(
-                    path=str(p), name=p.name, duration=info["duration"],
-                    width=info["width"], height=info["height"], fps=info["fps"],
-                    has_audio=int(bool(info["has_audio"])),
-                    cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
-                    **_funscript_fields(p),
-                )
-                stats["added"] += 1
-            elif row["status"] in ("ok", "no_pose"):
-                stats["already"] += 1
+        all_paths.extend(list_videos(folder))
+    total = len(all_paths)
+    for idx, p in enumerate(all_paths):
+        stats["scanned"] += 1
+        if progress:
+            progress(idx + 1, total, p.name, "scanning")
+        row = store.get_by_path(str(p))
+        if row is None:
+            info = ffmpeg.probe(p)
+            store.upsert_video(
+                path=str(p), name=p.name, duration=info["duration"],
+                width=info["width"], height=info["height"], fps=info["fps"],
+                has_audio=int(bool(info["has_audio"])),
+                cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
+                **_funscript_fields(p),
+            )
+            stats["added"] += 1
+        elif row["status"] in ("ok", "no_pose"):
+            stats["already"] += 1
     return stats
 
 
-def register_folder(folder: str | Path, cfg: AppConfig) -> dict:
+def register_folder(folder: str | Path, cfg: AppConfig, progress=None) -> dict:
     """扫描文件夹、把视频登记为待提取任务（不保存文件夹本身）。"""
     store = Store(db_path(cfg))
     try:
-        return _discover([str(Path(folder).resolve())], cfg, store)
+        return _discover([str(Path(folder).resolve())], cfg, store, progress=progress)
     finally:
         store.close()
 
 
-def register_videos(paths: list, cfg: AppConfig) -> dict:
+def register_videos(paths: list, cfg: AppConfig, progress=None) -> dict:
     store = Store(db_path(cfg))
     stats = {"scanned": 0, "added": 0, "already": 0}
     try:
-        for p in paths:
+        total = len(paths)
+        for idx, p in enumerate(paths):
             p = Path(p)
             if p.suffix.lower() not in VIDEO_EXTS:
                 continue
             stats["scanned"] += 1
+            if progress:
+                progress(idx + 1, total, p.name, "scanning")
             row = store.get_by_path(str(p))
             if row is None:
                 info = ffmpeg.probe(p)
@@ -479,13 +492,31 @@ def index_all(data_dir: str | Path | list, cfg: AppConfig, progress=None) -> lis
     return process_pending(cfg, progress)
 
 
+# 清空缓存时的额外保险：这些名字/后缀的文件绝不删除（防止误把源码/脚本清掉）
+_SOURCE_NAMES = {".git", ".github", ".gitignore", "README.md", "requirements.txt", "dance-cluster.spec"}
+_SOURCE_SUFFIXES = {".py", ".pyc", ".pyo", ".ps1", ".bat", ".cmd", ".sh", ".spec"}
+
+
+def _is_source_item(p: Path) -> bool:
+    """看起来是源码/脚本的缓存条目，清空时一律跳过。"""
+    return p.name in _SOURCE_NAMES or p.suffix.lower() in _SOURCE_SUFFIXES
+
+
 def clear_all(cfg: AppConfig) -> None:
-    """清空缓存目录下所有数据（数据库 + 每个视频的中间文件 + 缩略图）。保留缓存目录本身。"""
+    """清空缓存目录下所有数据（数据库 + 每个视频的中间文件 + 缩略图）。保留缓存目录本身。
+
+    安全保护：
+      * cache_dir 若指向受保护目录（项目根、其上级，或明显含源码的目录），直接抛
+        ValueError 拒绝清空；
+      * 即使缓存目录里混入源码/脚本，也按名字/后缀跳过，绝不删除。
+    """
     import shutil
 
-    base = Path(cfg.cache_dir)
+    base = assert_safe_cache_dir(cfg.cache_dir)
     if base.exists():
         for item in base.iterdir():
+            if _is_source_item(item):
+                continue
             try:
                 if item.is_dir():
                     shutil.rmtree(item, ignore_errors=True)

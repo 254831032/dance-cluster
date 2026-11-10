@@ -33,6 +33,16 @@ jobs:
           Copy-Item $fp.FullName .tools/bin/ffprobe.exe
           .tools/bin/ffmpeg.exe -version
 
+      - name: Download fpcalc (chromaprint)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/acoustid/chromaprint/releases/download/v1.6.2/chromaprint-fpcalc-1.6.2-windows-x86_64.zip" -OutFile fpcalc.zip
+          Expand-Archive fpcalc.zip -DestinationPath fpcalc_tmp
+          $fpc = Get-ChildItem fpcalc_tmp -Recurse -Filter fpcalc.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path .tools/bin | Out-Null
+          Copy-Item $fpc.FullName .tools/bin/fpcalc.exe
+          .tools/bin/fpcalc.exe -version
+
       - name: Download pose model
         shell: pwsh
         run: |

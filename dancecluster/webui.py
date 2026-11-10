@@ -269,6 +269,17 @@ def _log(msg: str) -> None:
 
 
 # ---------- 任务 ----------
+def _start_job(params: dict) -> str | None:
+    """启动后台任务（扫描/提取/分组）。已有任务在跑时返回错误信息，成功返回 None。"""
+    with _lock:
+        if _state["running"]:
+            return "有任务正在运行，请稍候或先取消"
+        _state.update(running=True, progress=0, total=0, stage="准备中", name="",
+                      log=[], error="", cancel=False)
+    threading.Thread(target=_run_job, args=(params,), daemon=True).start()
+    return None
+
+
 def _run_job(params: dict) -> None:
     def progress(i: int, total: int, name: str, stage: str) -> None:
         if _state["cancel"]:
@@ -286,11 +297,6 @@ def _run_job(params: dict) -> None:
         }
 
     try:
-        store = _store()
-        store.reset_stale_extracting()
-        before = _counts(store)
-        store.close()
-
         cfg = _cfg()
         cfg.clip.start = float(params.get("start", 0.0))
         cfg.clip.duration = float(params.get("duration", 20.0))
@@ -298,11 +304,30 @@ def _run_job(params: dict) -> None:
         cfg.match.dance_threshold = float(params.get("dance", 0.35))
         cfg.match.mirror_invariant = bool(params.get("mirror", True))
 
+        store = _store()
+        store.reset_stale_extracting()
+        store.close()
+
+        # 可选阶段 0：扫描新文件夹/视频（登记为待识别），大目录走后台 + 进度条
+        scan = params.get("scan")
+        if scan:
+            folder = scan.get("folder")
+            paths = scan.get("paths")
+            with _lock:
+                _state["stage"] = "scanning"
+            if folder:
+                _log(f"扫描文件夹：{folder}")
+                pipeline.register_folder(folder, cfg, progress=progress)
+            elif paths:
+                _log("扫描视频文件…")
+                pipeline.register_videos(paths, cfg, progress=progress)
+
+        before = _counts(_store())
         _log(f"开始提取（待处理 {before['pending']} 个，已完成 {before['done']} 个将跳过）…")
         records = pipeline.process_pending(cfg, progress=progress, only_ids=params.get("ids"))
         if _state["cancel"]:
             raise _Cancelled()
-        _log(f"提取完成，正在分组…")
+        _log("提取完成，正在分组…")
         pipeline.group(records, cfg)
         pre_generate_thumbs([r.id for r in records])
         after = _counts(_store())
@@ -377,6 +402,9 @@ def set_config():
         probe.unlink()
     except Exception as exc:
         return jsonify({"ok": False, "error": f"目录不可写：{resolved if 'resolved' in dir() else cache_dir}（{exc}）。请换一个有写入权限的目录。"}), 400
+
+    if config.is_protected_source_dir(p):
+        return jsonify({"ok": False, "error": "该目录包含程序源码/脚本（或位于项目目录之上），不能设为缓存目录，否则「清除所有数据」会误删源码；请选择独立文件夹。"}), 400
 
     resolved = str(p.resolve())
     s = config.load_settings()
@@ -479,14 +507,23 @@ def library_remove():
 def run():
     body = request.get_json(force=True, silent=True) or {}
     ids = [int(x) for x in body.get("ids", [])]
-    if not ids:
-        return jsonify({"ok": False, "error": "请先勾选要提取的视频"}), 400
-    with _lock:
-        if _state["running"]:
-            return jsonify({"ok": False, "error": "任务正在进行"}), 409
-        _state.update(running=True, progress=0, total=0, stage="准备中", name="",
-                      log=[], error="", cancel=False)
-    threading.Thread(target=_run_job, args=(body,), daemon=True).start()
+    err = _start_job({"ids": ids} if ids else {})
+    if err:
+        return jsonify({"ok": False, "error": err}), 409
+    return jsonify({"ok": True})
+
+
+@app.post("/api/import")
+def import_videos():
+    body = request.get_json(force=True, silent=True) or {}
+    folder = str(body.get("folder", "")).strip()
+    paths = [str(x) for x in body.get("paths", [])]
+    if not folder and not paths:
+        return jsonify({"ok": False, "error": "请选择文件夹或视频"}), 400
+    scan = {"folder": folder} if folder else {"paths": paths}
+    err = _start_job({"scan": scan})
+    if err:
+        return jsonify({"ok": False, "error": err}), 409
     return jsonify({"ok": True})
 
 
@@ -814,13 +851,16 @@ def videos_delete():
         store.delete_videos(ids)
     finally:
         store.close()
-    # 同步清理磁盘：缓存目录 + 缩略图/骨架预览
+    # 同步清理磁盘：只删缓存目录内的子目录，越界路径一律跳过（绝不碰缓存外的源码）
+    cache_root = Path(_current_cache_dir()).resolve()
     for cd in cache_dirs:
-        if cd:
-            try:
-                shutil.rmtree(cd, ignore_errors=True)
-            except Exception:
-                pass
+        if not cd:
+            continue
+        try:
+            Path(cd).resolve().relative_to(cache_root)  # 不在缓存目录内会抛 ValueError
+            shutil.rmtree(cd, ignore_errors=True)
+        except Exception:
+            pass
     base = Path(_current_cache_dir())
     for i in ids:
         for f in (base / "thumbs").glob(f"{i}_*") if (base / "thumbs").exists() else []:
@@ -949,7 +989,10 @@ def clear_all():
         if _state["running"]:
             return jsonify({"ok": False, "error": "有任务正在运行，请先取消"}), 409
     cfg = _cfg()
-    pipeline.clear_all(cfg)
+    try:
+        pipeline.clear_all(cfg)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True})
 
 
@@ -1198,8 +1241,7 @@ INDEX_HTML = r"""<!doctype html>
   <aside>
     <div class="brand">DanceCluster<small>舞蹈视频自动分组</small></div>
     <nav>
-      <button class="nav active" data-view="task"><span class="n">▶</span>识别任务</button>
-      <button class="nav" data-view="library"><span class="n">▤</span>原文件</button>
+      <button class="nav active" data-view="library"><span class="n">▤</span>原文件</button>
       <button class="nav" data-view="music"><span class="n">♪</span>音频分组</button>
       <button class="nav" data-view="dance"><span class="n">✣</span>动作分组</button>
       <button class="nav" data-view="test"><span class="n">🧪</span>测试</button>
@@ -1234,48 +1276,24 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
 
-    <!-- 识别任务 -->
-    <div class="view active" id="view-task">
-      <h2>识别任务</h2>
-      <p class="sub">第 1 步：添加文件夹或单个视频 → 第 2 步：开始提取。提取结果会出现在「原文件」。</p>
+    <!-- 原文件 -->
+    <div class="view active" id="view-library">
+      <h2>原文件</h2>
+      <p class="sub">导入文件夹或视频后自动识别，按背景音乐与舞蹈动作分组。</p>
       <div class="panel">
         <div class="row">
-          <button id="btn-add-folder">导入任务</button>
-          <button id="btn-add-videos" class="ghost">导入视频</button>
-        </div>
-        <div id="task-msg" class="muted" style="margin-top:10px"></div>
-      </div>
-      <div class="panel">
-        <div class="row" style="justify-content:space-between">
-          <b>待提取视频</b>
-          <span><button id="btn-remove-task" class="ghost small">移除选中</button> <span class="muted" id="task-sel-info">未选择</span></span>
-        </div>
-        <div id="task-list"></div>
-        <div class="empty" id="task-empty">暂无待提取视频，请先添加文件夹或视频。</div>
-      </div>
-      <div class="panel">
-        <div class="row">
-          <button id="btn-run">开始提取</button>
+          <button id="btn-import-folder">导入文件夹</button>
+          <button id="btn-import-videos" class="ghost">导入视频</button>
+          <button id="btn-run" class="ghost">开始识别</button>
           <button id="btn-cancel" class="ghost" disabled>取消</button>
-          <span class="muted">已提取过的会自动跳过。</span>
+          <span style="flex:1"></span>
+          <button id="btn-new-cat" class="ghost">＋ 新建分类</button>
         </div>
         <div class="bar"><i id="fill"></i></div>
         <div class="status" id="status">就绪</div>
       </div>
       <div class="panel">
-        <b>日志</b>
-        <pre class="log" id="log"></pre>
-      </div>
-    </div>
-
-    <!-- 原文件 -->
-    <div class="view" id="view-library">
-      <h2>原文件</h2>
-      <p class="sub">提取结果。可多选视频进行：归入分类、重新提取、删除。</p>
-      <div class="panel">
         <div class="row">
-          <button id="btn-new-cat" class="ghost">＋ 新建分类</button>
-          <span style="flex:1"></span>
           <button id="btn-view-list" class="toggle on">☰ 列表</button>
           <button id="btn-view-grid" class="toggle">▦ 图标</button>
           <span id="size-group" style="display:none">
@@ -1285,9 +1303,17 @@ INDEX_HTML = r"""<!doctype html>
           </span>
         </div>
         <div class="row" style="margin-top:10px">
-          <input type="text" id="search" placeholder="搜索文件名…" style="flex:1;max-width:260px">
+          <input type="text" id="search" placeholder="搜索文件名…" style="flex:1;max-width:220px">
           <div class="msel"><button id="msel-music-btn" class="ghost small" data-label="音乐分组">音乐分组 ▾</button><div id="msel-music" class="msel-panel"></div></div>
           <div class="msel"><button id="msel-dance-btn" class="ghost small" data-label="动作分组">动作分组 ▾</button><div id="msel-dance" class="msel-panel"></div></div>
+          <select id="status-filter" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+            <option value="all">全部状态</option>
+            <option value="pending">待识别</option>
+            <option value="extracting">识别中</option>
+            <option value="done">识别完成</option>
+            <option value="no_pose">无骨架</option>
+            <option value="error">出错</option>
+          </select>
           <select id="fs-filter" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px">
             <option value="all">全部脚本状态</option>
             <option value="none">无脚本</option>
@@ -1311,7 +1337,7 @@ INDEX_HTML = r"""<!doctype html>
           <button id="btn-delete" class="ghost small" style="color:var(--bad)">删除</button>
         </div>
         <div id="video-list"></div>
-        <div class="empty" id="video-empty">还没有视频，请先去「识别任务」添加文件夹并提取。</div>
+        <div class="empty" id="video-empty">还没有视频，点上方「导入文件夹」或「导入视频」开始。</div>
       </div>
     </div>
 
@@ -1450,7 +1476,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 const $ = s => document.querySelector(s);
-const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), selTask:new Set(), search:"", fMusic:new Set(), fDance:new Set(), fsLevel:"all", fsAxes:[], fsMaxAt:1, cacheDir:"", detailId:null };
+const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), search:"", fMusic:new Set(), fDance:new Set(), fStatus:"all", fsLevel:"all", fsAxes:[], fsMaxAt:1, cacheDir:"", detailId:null, running:false };
 
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 async function post(path, body) { return api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})}); }
@@ -1469,7 +1495,7 @@ const _thumbObs = new IntersectionObserver((entries) => {
 }, { rootMargin: "300px" });
 function observeThumb(v) { if (v) _thumbObs.observe(v); }
 function statusBadge(s) {
-  const m = {ok:["done","已完成"], no_pose:["np","无骨架"], extracting:["extracting","提取中"], pending:["","待处理"], error:["np","出错"]}[s]||["",""];
+  const m = {ok:["done","识别完成"], no_pose:["np","无骨架"], extracting:["extracting","识别中"], pending:["","待识别"], error:["np","出错"]}[s]||["",""];
   return `<span class="badge ${m[0]}">${m[1]||s}</span>`;
 }
 function confirm2(first, second) {
@@ -1500,7 +1526,6 @@ async function switchView(name) {
   if (name==="music") loadGroups("music");
   if (name==="dance") loadGroups("dance");
   if (name==="library") refreshLibrary();
-  if (name==="task") refreshTask();
   if (name==="settings") refreshConfig();
   if (name==="test") {
     if (!st.videos.length) await refreshLibrary();
@@ -1516,7 +1541,7 @@ document.getElementById("btn-save-cache").addEventListener("click", async () => 
   const r = await post("/api/config/set", {cache_dir: st.cacheDir, model: $("#pose-model").value});
   if (!r.ok) { $("#cache-hint").textContent = "✗ " + (r.error||"失败"); $("#cache-hint").style.color="var(--bad)"; return; }
   $("#cache-hint").textContent = "✓ 已启用：" + r.cache_dir; $("#cache-hint").style.color="var(--ok)";
-  await refreshConfig(); switchView("task");
+  await refreshConfig(); switchView("library");
 });
 document.getElementById("btn-pick-cache").addEventListener("click", async () => {
   const r = await post("/api/pick_folder", {});
@@ -1530,7 +1555,7 @@ document.getElementById("btn-default-cache").addEventListener("click", async () 
 document.getElementById("btn-clear").addEventListener("click", async () => {
   if (!confirm("确定清除所有数据吗？将删除数据库、缓存、缩略图（不影响源视频和缓存目录设置）。")) return;
   const r = await post("/api/clear", {});
-  if (r.ok) { alert("已清除"); st.sel.clear(); st.selFolders.clear(); st.selTask.clear(); switchView("task"); refreshTask(); }
+  if (r.ok) { alert("已清除"); st.sel.clear(); st.selFolders.clear(); switchView("library"); refreshLibrary(); }
   else alert(r.error || "清除失败");
 });
 async function refreshConfig() {
@@ -1552,102 +1577,64 @@ async function refreshConfig() {
 }
 function applyGate() {
   document.querySelectorAll(".nav").forEach(b => { if (b.dataset.view!=="settings") b.disabled = !st.configured; });
-  $("#btn-run").disabled = !st.configured;
-  $("#btn-add-folder").disabled = !st.configured;
+  applyRunUI(false);
   if (!st.configured) switchView("settings");
 }
 
-// ---- 识别任务：文件夹 ----
-document.getElementById("btn-add-folder").addEventListener("click", async () => {
+// ---- 导入 + 识别 ----
+function applyRunUI(running) {
+  const run = running || !st.configured;
+  $("#btn-import-folder").disabled = run;
+  $("#btn-import-videos").disabled = run;
+  $("#btn-run").disabled = run;
+  $("#btn-cancel").disabled = !running;
+}
+function beginPolling() {
+  poll();
+  if (st.timer) clearInterval(st.timer);
+  st.timer = setInterval(poll, 700);
+}
+document.getElementById("btn-import-folder").addEventListener("click", async () => {
   const r = await post("/api/pick_folder", {});
-  if (!r.ok) { if (r.error!=="已取消") alert(r.error); return; }
-  const a = await post("/api/library/add", {path:r.path});
-  if (a.ok) { showTaskMsg(`扫描 ${a.scanned} 个视频，成功添加任务 ${a.added} 个，已完成提取 ${a.already} 个`); refreshTask(); }
-  else alert(a.error);
+  if (!r.ok) { if (r.error !== "已取消") alert(r.error); return; }
+  const a = await post("/api/import", { folder: r.path });
+  if (a.ok) { beginPolling(); }
+  else alert(a.error || "启动失败");
 });
-document.getElementById("btn-add-videos").addEventListener("click", async () => {
+document.getElementById("btn-import-videos").addEventListener("click", async () => {
   const r = await post("/api/pick_files", {});
-  if (!r.ok) { if (r.error!=="已取消") alert(r.error); return; }
-  const a = await post("/api/library/add_videos", {paths:r.paths});
-  if (a.ok) { showTaskMsg(`扫描 ${a.scanned} 个视频，成功添加任务 ${a.added} 个，已完成提取 ${a.already} 个`); refreshTask(); }
-  else alert(a.error);
+  if (!r.ok) { if (r.error !== "已取消") alert(r.error); return; }
+  const a = await post("/api/import", { paths: r.paths });
+  if (a.ok) { beginPolling(); }
+  else alert(a.error || "启动失败");
 });
-document.getElementById("btn-remove-task").addEventListener("click", async () => {
-  if (!st.selTask.size) { alert("请先勾选视频"); return; }
-  if (!confirm(`移除选中的 ${st.selTask.size} 个视频？`)) return;
-  await post("/api/videos/delete", {ids:[...st.selTask]});
-  st.selTask.clear(); refreshTask();
-});
-async function refreshTask() {
-  const d = await api("/api/library");
-  if (d.configured===false) { st.configured=false; applyGate(); return; }
-  st.configured = true;
-  renderTaskList(d.videos.filter(v => v.status==="pending" || v.status==="extracting"));
-}
-function showTaskMsg(t) { const el = $("#task-msg"); el.textContent = t; el.style.color = "var(--ok)"; }
-function renderTaskList(videos) {
-  const el = $("#task-list");
-  // 只保留仍在「待提取」里的选择，避免提取完成后误删已完成的视频
-  const valid = new Set(videos.map(v => v.id));
-  for (const id of [...st.selTask]) if (!valid.has(id)) st.selTask.delete(id);
-  $("#task-empty").style.display = videos.length ? "none" : "";
-  $("#task-sel-info").textContent = st.selTask.size ? `已选 ${st.selTask.size} 个` : "未选择";
-  el.innerHTML = "";
-  if (!videos.length) return;
-  const t = document.createElement("table");
-  const thead = document.createElement("thead");
-  thead.innerHTML = `<tr><th style="width:30px"><input type="checkbox" id="task-check-all" title="全选"></th><th style="width:76px"></th><th>文件</th><th>分辨率</th><th>时长</th><th>状态</th></tr>`;
-  const tb = document.createElement("tbody");
-  videos.forEach(v => {
-    const tr = document.createElement("tr");
-    tr.dataset.id = v.id;
-    if (st.selTask.has(v.id)) tr.className="sel";
-    const ck = st.selTask.has(v.id) ? "checked":"";
-    tr.innerHTML = `<td><input type="checkbox" ${ck}></td><td><img class="thumb-sm" src="/api/thumb/${v.id}"></td><td>${esc(v.name)}</td><td>${v.width}×${v.height}</td><td>${v.duration}s</td><td>${statusBadge(v.status)}</td>`;
-    const cb = tr.querySelector("input[type=checkbox]");
-    cb.addEventListener("click", e => {
-      e.stopPropagation();
-      st.selTask.has(v.id) ? st.selTask.delete(v.id) : st.selTask.add(v.id);
-      renderTaskList(videos);
-    });
-    tr.addEventListener("click", e => {
-      if (e.target.type === "checkbox") return;
-      st.selTask.has(v.id) ? st.selTask.delete(v.id) : st.selTask.add(v.id);
-      renderTaskList(videos);
-    });
-    tb.appendChild(tr);
-  });
-  t.appendChild(thead); t.appendChild(tb);
-  const all = t.querySelector("#task-check-all");
-  all.checked = videos.length > 0 && videos.every(v => st.selTask.has(v.id));
-  all.addEventListener("click", e => {
-    e.stopPropagation();
-    if (all.checked) videos.forEach(v => st.selTask.add(v.id)); else videos.forEach(v => st.selTask.delete(v.id));
-    renderTaskList(videos);
-  });
-  el.appendChild(t);
-}
-// ---- 识别任务：运行 ----
 document.getElementById("btn-run").addEventListener("click", async () => {
-  if (!st.selTask.size) { alert("请先勾选要提取的视频"); return; }
-  const r = await post("/api/run", {ids:[...st.selTask]});
-  if (!r.ok) { alert(r.error||"启动失败"); return; }
-  $("#btn-run").disabled=true; $("#btn-cancel").disabled=false;
-  poll(); if (st.timer) clearInterval(st.timer); st.timer=setInterval(poll, 800);
+  const r = await post("/api/run", {});
+  if (!r.ok) { alert(r.error || "启动失败"); return; }
+  beginPolling();
 });
-document.getElementById("btn-cancel").addEventListener("click", ()=>{ post("/api/cancel"); $("#btn-cancel").disabled=true; });
+document.getElementById("btn-cancel").addEventListener("click", async () => {
+  await post("/api/cancel");
+  $("#btn-cancel").disabled = true;
+});
 async function poll() {
   const s = await api("/api/status");
-  const pct = s.total ? Math.round(100*s.progress/s.total) : 0;
-  $("#fill").style.width = pct+"%";
-  $("#status").textContent = s.running ? `[${s.progress}/${s.total}] ${s.name} · ${s.stage}` : s.stage;
-  if (s.log && s.log.length) { $("#log").textContent = s.log.join("\n"); $("#log").scrollTop=$("#log").scrollHeight; }
+  st.running = s.running;
+  const pct = s.total ? Math.round(100 * s.progress / s.total) : 0;
+  $("#fill").style.width = pct + "%";
+  if (s.stage === "scanning") {
+    $("#status").textContent = `扫描中 ${s.progress}${s.total ? "/" + s.total : ""} · ${s.name}`;
+  } else if (s.stage === "extracting") {
+    $("#status").textContent = `识别中 [${s.progress}/${s.total}] ${s.name}`;
+  } else if (s.running) {
+    $("#status").textContent = s.stage + (s.name ? " · " + s.name : "");
+  } else {
+    $("#status").textContent = s.stage || "就绪";
+  }
+  applyRunUI(s.running);
   if (!s.running) {
-    $("#btn-run").disabled=false; $("#btn-cancel").disabled=true;
-    if (st.timer){clearInterval(st.timer); st.timer=null;}
-    st.selTask.clear();
+    if (st.timer) { clearInterval(st.timer); st.timer = null; }
     refreshLibrary();
-    refreshTask();
   }
 }
 
@@ -1675,14 +1662,20 @@ function syncSizeBtns() {
 
 document.getElementById("btn-reextract").addEventListener("click", async () => {
   if (!st.sel.size) { alert("请先勾选视频"); return; }
+  if (st.running) { alert("识别进行中，请先取消再重新提取"); return; }
   const n = st.sel.size;
   if (!confirm2(`重新提取选中的 ${n} 个视频？（会清空它们的提取结果，需要重跑）`,
                 "再次确认：确定重新提取？")) return;
-  const r = await post("/api/videos/reextract", {ids:[...st.sel]});
-  if (r.ok) { alert("已标记重新提取，请到「识别任务」点开始提取"); st.sel.clear(); refreshLibrary(); }
+  const ids = [...st.sel];
+  const r = await post("/api/videos/reextract", {ids});
+  if (!r.ok) { alert(r.error || "失败"); return; }
+  st.sel.clear();
+  const a = await post("/api/run", {ids});
+  if (a.ok) { beginPolling(); } else alert(a.error || "启动失败");
 });
 document.getElementById("btn-delete").addEventListener("click", async () => {
   if (!st.sel.size) { alert("请先勾选视频"); return; }
+  if (st.running) { alert("识别进行中，请先取消再删除"); return; }
   if (!confirm2(`从库里删除选中的 ${st.sel.size} 个视频？（不会删除源文件）`,
                 "再次确认：确定删除？缓存和缩略图也会一并清理。")) return;
   const r = await post("/api/videos/delete", {ids:[...st.sel]});
@@ -2314,14 +2307,17 @@ document.getElementById("detail-preview").addEventListener("click", () => {
 });
 document.getElementById("detail-reextract").addEventListener("click", async () => {
   if (st.detailId == null) return;
+  if (st.running) { alert("识别进行中，请先取消再重新提取"); return; }
   if (!confirm2("重新提取这个视频？（会清空它的提取结果）", "再次确认：确定重新提取？")) return;
   const r = await post("/api/videos/reextract", {ids:[st.detailId]});
   if (!r.ok) { alert(r.error||"失败"); return; }
   $("#detail-modal").style.display = "none";
-  refreshLibrary();
+  const a = await post("/api/run", {ids:[st.detailId]});
+  if (a.ok) { beginPolling(); } else alert(a.error || "启动失败");
 });
 document.getElementById("detail-delete").addEventListener("click", async () => {
   if (st.detailId == null) return;
+  if (st.running) { alert("识别进行中，请先取消再删除"); return; }
   if (!confirm2("删除这个视频（含缓存/缩略图，不影响源文件）？", "再次确认：确定删除？")) return;
   const r = await post("/api/videos/delete", {ids:[st.detailId]});
   if (!r.ok) { alert(r.error||"失败"); return; }
@@ -2452,10 +2448,12 @@ function renderGroupFilters() {
   updateMselLabel("msel-dance-btn", st.fDance);
 }
 document.getElementById("search").addEventListener("input", e => { st.search = e.target.value.trim(); renderVideos(); });
+document.getElementById("status-filter").addEventListener("change", e => { st.fStatus = e.target.value; renderVideos(); });
 document.getElementById("fs-filter").addEventListener("change", e => { st.fsLevel = e.target.value; renderVideos(); });
 document.getElementById("btn-reset-filter").addEventListener("click", () => {
   st.search = ""; $("#search").value = "";
   st.fMusic.clear(); st.fDance.clear(); st.filterCat = null;
+  st.fStatus = "all"; $("#status-filter").value = "all";
   st.fsLevel = "all"; $("#fs-filter").value = "all";
   renderCatBar(); renderGroupFilters(); renderVideos();
 });
@@ -2476,6 +2474,9 @@ function filteredVideos() {
   let list = st.videos;
   if (st.filterCat != null) list = list.filter(v => v.cats.includes(st.filterCat));
   if (st.search) list = list.filter(v => v.name.toLowerCase().includes(st.search.toLowerCase()));
+  if (st.fStatus !== "all") {
+    list = list.filter(v => st.fStatus === "done" ? v.status === "ok" : v.status === st.fStatus);
+  }
   if (st.fMusic.size) list = list.filter(v => v.music_group != null && st.fMusic.has(v.music_group));
   if (st.fDance.size) list = list.filter(v => v.dance_group != null && st.fDance.has(v.dance_group));
   if (st.fsLevel !== "all") {
@@ -2593,7 +2594,7 @@ async function loadGroups(type) {
   const d = await api("/api/groups?type="+type);
   const el = document.getElementById(type+"-groups"); el.innerHTML="";
   if (!d.configured) { el.innerHTML='<div class="empty">请先设置缓存目录。</div>'; return; }
-  if (!d.groups.length) { el.innerHTML='<div class="empty">还没有分组结果，去「识别任务」提取。</div>'; return; }
+  if (!d.groups.length) { el.innerHTML='<div class="empty">还没有分组结果，去「原文件」导入并识别。</div>'; return; }
   d.groups.forEach(g => {
     const div=document.createElement("div"); div.className="group";
     const head=document.createElement("div"); head.className="group-head";
@@ -2642,7 +2643,7 @@ async function loadGroups(type) {
 }
 
 // ---- 启动 ----
-(async function init(){ await refreshConfig(); if (st.configured) { switchView("task"); refreshTask(); } })();
+(async function init(){ await refreshConfig(); if (st.configured) { switchView("library"); refreshLibrary(); } })();
 </script>
 </body>
 </html>

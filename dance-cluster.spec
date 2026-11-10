@@ -28,6 +28,13 @@ for exe in ("ffmpeg", "ffprobe"):
             datas.append((p, ".tools/bin"))
             break
 
+# fpcalc (chromaprint) — 音频指纹，判「是否同一首 BGM」
+for name in ("fpcalc.exe", "fpcalc"):
+    p = os.path.join(".tools", "bin", name)
+    if os.path.exists(p):
+        datas.append((p, ".tools/bin"))
+        break
+
 # mediapipe 的原生库与数据
 datas += collect_data_files("mediapipe")
 binaries += collect_dynamic_libs("mediapipe")

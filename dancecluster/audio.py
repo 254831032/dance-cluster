@@ -141,9 +141,10 @@ def _fpcalc_path() -> str | None:
     env = os.environ.get("DANCECLUSTER_FPCALC")
     if env and Path(env).exists():
         return env
-    local = Path(__file__).resolve().parents[1] / ".tools" / "bin" / "fpcalc"
-    if local.exists():
-        return str(local)
+    base = Path(__file__).resolve().parents[1] / ".tools" / "bin"
+    for cand in (base / "fpcalc", base / "fpcalc.exe"):
+        if cand.exists():
+            return str(cand)
     return shutil.which("fpcalc")
 
 
