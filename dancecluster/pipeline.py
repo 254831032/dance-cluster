@@ -23,7 +23,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 # 特征算法版本：改动特征计算后 +1，老缓存会自动被标记重提取
 # v3：补上 chromaprint 指纹（此前 fpcalc 未打包，指纹为空导致音频匹配退化为纯 chroma）
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4
 
 
 def _is_current_version(v) -> bool:

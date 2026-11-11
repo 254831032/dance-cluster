@@ -107,26 +107,83 @@ def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, flo
     return inter / union
 
 
+_CORE = (11, 12, 23, 24)          # 肩 2 + 髋 2：必须大部分可见才算「一个完整的人」
+_MIN_VALID = 12                   # 至少 12 个点可见，排除只露一条胳膊的残肢
+_VIS_THRESHOLD = 0.5
+
+
+def _hip_center(pts: np.ndarray, vis: np.ndarray) -> np.ndarray | None:
+    if vis[23] > _VIS_THRESHOLD and vis[24] > _VIS_THRESHOLD:
+        return (pts[23, :2] + pts[24, :2]) / 2.0
+    return None
+
+
 def _pick_person(
     norm_pts: list[np.ndarray],
     world_pts: list[np.ndarray],
     vis: list[np.ndarray],
     prev_bbox: tuple[float, float, float, float] | None,
+    prev_hip: np.ndarray | None = None,
 ) -> int:
-    """在多个候选里挑主舞者：面积 + 居中 + 可见度 + 时序连续性。"""
+    """在多个候选里挑主舞者。
+
+    过滤掉「残肢/不完整的人」：核心点（双肩+双髋）至少 3 个可见、总可见点 >= 12。
+    bbox 只用可见点计算，避免低置信点把框撑大。
+    时序上用 IoU + 髋中心距离双重约束，防止跳到画面里的其他人。
+    """
     best_idx, best_score = -1, -1e9
     for i, pts in enumerate(norm_pts):
-        bbox = _bbox_2d(pts)
+        v = vis[i]
+        valid = v > _VIS_THRESHOLD
+        n_valid = int(valid.sum())
+        if n_valid < _MIN_VALID:
+            continue
+        if sum(1 for k in _CORE if v[k] > _VIS_THRESHOLD) < 3:
+            continue
+
+        p2 = pts[valid, :2]
+        bbox = (float(p2[:, 0].min()), float(p2[:, 1].min()),
+                float(p2[:, 0].max()), float(p2[:, 1].max()))
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         area = max(0.0, w) * max(0.0, h)
         cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
         centered = 1.0 - min(1.0, ((cx - 0.5) ** 2 + (cy - 0.5) ** 2) ** 0.5 / 0.7071)
-        score = 2.0 * area + 0.8 * centered + 1.0 * float(np.mean(vis[i]))
+        score = 2.0 * area + 0.8 * centered + 1.0 * float(v[valid].mean())
+
         if prev_bbox is not None:
             score += 1.5 * _iou(bbox, prev_bbox)
+            hip = _hip_center(pts, v)
+            if prev_hip is not None and hip is not None:
+                d = float(np.linalg.norm(hip - prev_hip))
+                score -= 2.5 * min(d, 1.0)     # 距离惩罚：跳太远基本可以排除
+
         if score > best_score:
             best_score, best_idx = score, i
     return best_idx
+
+
+def _enhance_low_light(bgr: np.ndarray, mean_threshold: float = 95.0) -> np.ndarray:
+    """低照度提亮：CLAHE + 自适应 gamma。几何不变，因此 2D 坐标可直接叠加回原视频。"""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    mean = float(gray.mean())
+    if mean >= mean_threshold:
+        return bgr
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    out = cv2.cvtColor(cv2.merge([clahe.apply(l), a, b]), cv2.COLOR_LAB2BGR)
+    m = float(cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).mean())
+    target = 118.0
+    if 1.0 < m < target:
+        # out = (i/255)^exp，exp<1 变亮；由「目标均值」反解 exp
+        exp = float(np.log(target / 255.0) / np.log(m / 255.0))
+        exp = min(1.0, max(0.35, exp))
+        lut = np.array(
+            [min(255, max(0, int(((i / 255.0) ** exp) * 255.0))) for i in range(256)],
+            dtype=np.uint8,
+        )
+        out = cv2.LUT(out, lut)
+    return out
 
 
 def _is_shot_cut(prev_gray: np.ndarray | None, gray: np.ndarray, threshold: float = 0.22) -> bool:
@@ -220,6 +277,7 @@ def extract_pose(
     shot_start = 0.0
     prev_gray = None
     prev_bbox = None
+    prev_hip = None
     frame_idx = 0
     out_idx = 0
 
@@ -243,9 +301,10 @@ def extract_pose(
                 shots.append((shot_start, t))
                 shot_start = t
                 prev_bbox = None
+                prev_hip = None
             prev_gray = gray
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(_enhance_low_light(frame), cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(mp_image, int(round(t * 1000 + ts_offset_ms)))
 
@@ -257,10 +316,11 @@ def extract_pose(
                 world_pts.append(np.array([[l.x, l.y, l.z] for l in pose_world], dtype=np.float32))
                 vis_list.append(np.array([getattr(l, "visibility", 1.0) for l in pose_norm], dtype=np.float32))
 
-            if world_pts:
-                idx = _pick_person(norm_pts, world_pts, vis_list, prev_bbox)
+            idx = _pick_person(norm_pts, world_pts, vis_list, prev_bbox, prev_hip) if world_pts else -1
+            if idx >= 0:
                 bbox = _bbox_2d(norm_pts[idx])
                 prev_bbox = bbox
+                prev_hip = _hip_center(norm_pts[idx], vis_list[idx])
                 worlds.append(world_pts[idx])
                 viss.append(vis_list[idx])
                 presents.append(True)

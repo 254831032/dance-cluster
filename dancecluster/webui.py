@@ -24,7 +24,7 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_file
 
-from . import config, ffmpeg, funscript, pipeline, pose
+from . import config, ffmpeg, flow, funscript, pipeline, pose
 from .config import AppConfig
 from .db import Store
 
@@ -728,6 +728,39 @@ def pose3d_data(video_id):
     })
 
 
+@app.get("/api/flow/<int:video_id>")
+def flow_data(video_id):
+    row = _get_row(video_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    src = row["path"]
+    if not src or not Path(src).exists():
+        return jsonify({"ok": False, "error": "源视频缺失"}), 404
+    cdir = Path(row["cache_dir"])
+    npz = cdir / "flow.npz"
+    if not npz.exists():
+        try:
+            cfg = _cfg()
+            seq = flow.extract_flow(src, cfg.pose.model_file(),
+                                    max_seconds=float(row["duration"] or 0) or None)
+            seq.save(npz)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"光流提取失败：{e}"}), 500
+    import numpy as np
+    with np.load(npz) as d:
+        pos = d["pos"]
+        fps = float(d["fps"]) if d["fps"] is not None and d["fps"].size else 15.0
+    F = int(pos.shape[0])
+    step = max(1, F // 900)
+    pos = pos[::step]
+    return jsonify({
+        "ok": True,
+        "fps": (fps / step) if step > 1 else fps,
+        "frames": int(pos.shape[0]),
+        "pos": [[round(float(x), 2), round(float(y), 2)] for x, y in pos],
+    })
+
+
 @app.get("/api/thumb_mp4/<int:video_id>")
 def thumb_mp4(video_id):
     out = _generate_thumb_sync(video_id, "thumb_mp4")
@@ -1396,9 +1429,14 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="panel">
         <b>脚本信息</b>
-        <p class="muted">六轴映射：L0=上下 · L1=左右 · L2=前后 · R0=扭转 · R1=俯仰 · R2=侧倾（已做断点插值 + 平滑）</p>
+        <p class="muted">六轴映射（以髋骨为准）：L0=上下 · L1=左右 · L2=前后 · R0=骨盆扭转 · R1=骨盆俯仰 · R2=骨盆侧倾（已做断点插值 + 平滑）</p>
         <div class="row" style="margin:6px 0 10px">
           <label class="muted">主行程幅度 <input type="range" id="sig-gain" min="30" max="200" value="100" style="width:110px;vertical-align:middle"></label>
+        </div>
+        <div class="row" style="margin:4px 0 8px;flex-wrap:wrap">
+          <span class="muted">平移信号源：</span>
+          <label class="muted"><input type="radio" name="src-mode" id="src-skel" checked> 骨架</label>
+          <label class="muted"><input type="radio" name="src-mode" id="src-flow"> 光流(AI分割+Farneback)</label>
         </div>
         <div class="row" style="margin:4px 0 8px;flex-wrap:wrap">
           <span class="muted">启用：</span>
@@ -1856,6 +1894,11 @@ async function testLoad(id) {
   const [d2, d3] = await Promise.all([api("/api/pose/" + id), api("/api/pose3d/" + id)]);
   TEST.p2 = d2.ok ? d2 : null;
   TEST.p3 = d3.ok ? d3 : null;
+  TEST.flow = null;
+  if (signalSource() === "flow") {
+    const df = await api("/api/flow/" + id);
+    TEST.flow = df.ok ? df : null;
+  }
   TEST.fps = (TEST.p2 && TEST.p2.fps) || (TEST.p3 && TEST.p3.fps) || 15;
   TEST.frame = 0;
   TEST.playing = false;
@@ -1863,6 +1906,7 @@ async function testLoad(id) {
   const v = document.getElementById("t2d-video");
   if (v) { v.src = "/api/clip/" + id; v.load(); }
   TEST.signals = testComputeSignals();
+  emuReset();
   testDrawFrame(0);
 }
 
@@ -1904,8 +1948,11 @@ function testComputeSignals() {
     return out;
   };
   const norm01 = arr => {
-    const mn = Math.min(...arr), mx = Math.max(...arr), span = (mx - mn) || 1;
-    return arr.map(v => (v - mn) / span);
+    const sorted = [...arr].sort((a, b) => a - b);
+    const lo = sorted[Math.floor(sorted.length * 0.02)];
+    const hi = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.98))];
+    const span = (hi - lo) || 1;
+    return arr.map(v => Math.min(1, Math.max(0, (v - lo) / span)));
   };
   const clampJumps01 = (arr, maxD) => {
     const out = arr.slice();
@@ -1918,6 +1965,7 @@ function testComputeSignals() {
 
   // 髋部 2D（x=左右, y=上下）+ 身体尺寸（前后）
   const wx = [], wy = [], wz = [];
+  let sumBx = 0, sumBy = 0, cntB = 0;
   for (let f = 0; f < n; f++) {
     const fr = p2[f] || [];
     const h23 = fr[23], h24 = fr[24];
@@ -1925,26 +1973,58 @@ function testComputeSignals() {
     else { wx.push(NaN); wy.push(NaN); }
     const s11 = fr[11], s12 = fr[12];
     wz.push((s11 && s12) ? Math.hypot(s12[0]-s11[0], s12[1]-s11[1]) : NaN);
+    // 身体轴（肩中心→髋中心，向上）：用于估计相机滚转
+    if (s11 && s12 && h23 && h24) {
+      const sx = (s11[0]+s12[0])/2, sy = (s11[1]+s12[1])/2;
+      const hx = (h23[0]+h24[0])/2, hy = (h23[1]+h24[1])/2;
+      sumBx += sx - hx; sumBy += sy - hy; cntB++;
+    }
   }
 
-  // 3D 旋转：R0=扭转(肩线), R1=俯仰, R2=侧倾
+  // ===== 参考坐标系对齐（相机滚转补偿）=====
+  let rot = 0;
+  if (cntB > 0) {
+    const bx = sumBx / cntB, by = sumBy / cntB;
+    const len = Math.hypot(bx, by);
+    if (len > 1e-6) {
+      const dotUp = -by / len;                 // 身体轴与图像「上」的夹角余弦
+      if (dotUp > 0.7071) rot = Math.atan2(-bx, -by);   // 接近竖直才修正；坐/躺退回 0
+    }
+  }
+  const cosR = Math.cos(rot), sinR = Math.sin(rot);
+  const rot2 = (x, y) => [x * cosR - y * sinR, x * sinR + y * cosR];
+  const rot3 = v => { const a = rot2(v[0], v[1]); return [a[0], a[1], v[2]]; };
+  const rx = [], ry = [];
+  for (let f = 0; f < n; f++) {
+    const a = rot2(wx[f], wy[f]);
+    rx.push(a[0]); ry.push(a[1]);
+  }
+
+  // 3D 旋转：全部以髋（骨盆）为准，先做滚转对齐
   const rawR0 = [], rawR1 = [], rawR2 = [];
   for (let f = 0; f < n; f++) {
-    const fr = p2[f] || [];
-    const s11 = fr[11], s12 = fr[12];
-    rawR0.push((s11 && s12) ? Math.atan2(s12[1]-s11[1], s12[0]-s11[0]) : NaN);
     const fw = p3[f] || [];
-    let pitch = NaN, roll = NaN;
-    if (fw.length >= 33 && fw[11] && fw[12] && fw[23] && fw[24]) {
-      const sm = [(fw[11][0]+fw[12][0])/2, (fw[11][1]+fw[12][1])/2, (fw[11][2]+fw[12][2])/2];
-      const hm = [(fw[23][0]+fw[24][0])/2, (fw[23][1]+fw[24][1])/2, (fw[23][2]+fw[24][2])/2];
-      const ux = sm[0]-hm[0], uy = sm[1]-hm[1], uz = sm[2]-hm[2];
-      if (Math.hypot(ux, uy, uz) > 1e-4) {
-        pitch = Math.atan2(uz, -uy);
-        roll = Math.atan2(ux, -uy);
+    let yaw = NaN, pitch = NaN, roll = NaN;
+    if (fw.length >= 33 && fw[23] && fw[24]) {
+      const h23 = rot3(fw[23]), h24 = rot3(fw[24]);
+      const hx = h24[0] - h23[0], hy = h24[1] - h23[1], hz = h24[2] - h23[2];
+      if (Math.hypot(hx, hy, hz) > 1e-4) {
+        yaw = Math.atan2(hz, hx);    // 骨盆扭转：左右髋前后错开
+        roll = Math.atan2(hy, hx);   // 骨盆侧倾：左右髋高低差
+        if (yaw > Math.PI/2) yaw -= Math.PI;
+        else if (yaw < -Math.PI/2) yaw += Math.PI;
+        if (roll > Math.PI/2) roll -= Math.PI;
+        else if (roll < -Math.PI/2) roll += Math.PI;
+      }
+      if (fw[11] && fw[12]) {
+        const s11 = rot3(fw[11]), s12 = rot3(fw[12]);
+        const sm = [(s11[0]+s12[0])/2, (s11[1]+s12[1])/2, (s11[2]+s12[2])/2];
+        const hm = [(h23[0]+h24[0])/2, (h23[1]+h24[1])/2, (h23[2]+h24[2])/2];
+        const ux = sm[0]-hm[0], uy = sm[1]-hm[1], uz = sm[2]-hm[2];
+        if (Math.hypot(ux, uy, uz) > 1e-4) pitch = Math.atan2(uz, -uy);
       }
     }
-    rawR1.push(pitch); rawR2.push(roll);
+    rawR0.push(yaw); rawR1.push(pitch); rawR2.push(roll);
   }
 
   const smooth01 = arr => {
@@ -1966,8 +2046,16 @@ function testComputeSignals() {
   };
   const hold = (arr, key) => enabled(key) ? arr : arr.map(() => 0.5);
 
-  const L0 = hold(flip(smooth01(wy), "l0"), "l0");   // 上下
-  const L1 = hold(flip(smooth01(wx), "l1"), "l1");   // 左右
+  let L0, L1;
+  if (signalSource() === "flow" && TEST.flow && TEST.flow.pos && TEST.flow.pos.length) {
+    const fx = TEST.flow.pos.map(q => q[0]);
+    const fy = TEST.flow.pos.map(q => q[1]);
+    L0 = hold(flip(smooth01(fy), "l0"), "l0");   // 上下（光流累积，向下为正）
+    L1 = hold(flip(smooth01(fx), "l1"), "l1");   // 左右
+  } else {
+    L0 = hold(flip(smooth01(ry), "l0"), "l0");   // 上下（骨架，向下为正）
+    L1 = hold(flip(smooth01(rx), "l1"), "l1");   // 左右
+  }
   const L2 = hold(flip(smooth01(wz), "l2"), "l2");   // 前后
   const R0 = hold(flip(smooth01(rawR0), "r0"), "r0");
   const R1 = hold(flip(smooth01(rawR1), "r1"), "r1");
@@ -2119,6 +2207,10 @@ function manualMode() {
   const el = document.getElementById("manual-mode");
   return !!el && el.checked;
 }
+function signalSource() {
+  const el = document.getElementById("src-flow");
+  return (el && el.checked) ? "flow" : "skel";
+}
 
 function emuWrite(idx) {
   const hint = document.getElementById("osr6-emu-hint");
@@ -2178,6 +2270,13 @@ function testPlayLoop() {
   TEST.raf = requestAnimationFrame(testPlayLoop);
 }
 
+function emuReset() {
+  if (!_osr6emu) return;
+  try {
+    _osr6emu.write("L005000I50 L105000I50 L205000I50 R005000I50 R105000I50 R205000I50\n");
+  } catch (e) {}
+}
+
 function testTogglePlay() {
   const v = document.getElementById("t2d-video");
   if (!v || !TEST.id) return;
@@ -2186,6 +2285,7 @@ function testTogglePlay() {
     document.getElementById("test-play").textContent = "▶ 播放";
     if (TEST.raf) { cancelAnimationFrame(TEST.raf); TEST.raf = null; }
   } else {
+    emuReset();                       // 播放前先回正
     TEST.playing = true;
     document.getElementById("test-play").textContent = "⏸ 暂停";
     try { v.play(); } catch(e){}
@@ -2211,6 +2311,18 @@ document.getElementById("test-3d-auto").addEventListener("change", e => { TEST.a
     const lbl = document.getElementById("m-" + a + "-v");
     if (lbl) lbl.textContent = el.value;
     if (manualMode()) testDrawOsr6(TEST.frame);
+  });
+});
+["src-skel", "src-flow"].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("change", async () => {
+    if (signalSource() === "flow" && TEST.id && !TEST.flow) {
+      const d = await api("/api/flow/" + TEST.id);
+      TEST.flow = d.ok ? d : null;
+    }
+    TEST.signals = testComputeSignals();
+    testDrawCurves(TEST.frame);
+    testDrawOsr6(TEST.frame);
   });
 });
 document.getElementById("manual-mode").addEventListener("change", e => {
