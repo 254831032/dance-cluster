@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio, clustering, dtw, features, ffmpeg, funscript, pose
+from . import audio, clustering, dtw, features, ffmpeg, funscript, pose, scripts
 from .config import AppConfig, assert_safe_cache_dir
 from .db import Store
 
@@ -269,16 +269,29 @@ def _close_async(landmarker) -> None:
 
 
 def _funscript_fields(video_path) -> dict:
-    """扫描视频同目录的 funscript，返回要写库的字段。"""
+    """扫描视频同目录的 funscript，返回要写库的字段。带脚本的顺手做源备份。"""
     try:
         info = funscript.scan(video_path)
     except Exception:
         info = {"count": 0, "axes": []}
     axes = info.get("axes") or []
+    if int(info.get("count", 0)) > 0:
+        try:
+            scripts.ensure_source_backup(video_path)
+        except Exception:
+            pass
     return {
         "funscript_count": int(info.get("count", 0)),
         "funscript_axes": json.dumps(axes, ensure_ascii=False) if axes else None,
     }
+
+
+def _ensure_own_active(store, vid: int, has_script: bool) -> None:
+    """登记后：带脚本的视频，默认激活自己的源（若还没有激活）。"""
+    if not has_script:
+        return
+    if not store.linked_sources(int(vid)):
+        store.set_active_script(int(vid), int(vid))
 
 
 def scan_funscripts(ids: list[int], cfg: AppConfig) -> dict:
@@ -295,6 +308,13 @@ def scan_funscripts(ids: list[int], cfg: AppConfig) -> dict:
             except Exception:
                 info = {"count": 0, "axes": []}
             store.set_funscript(int(vid), info["count"], info["axes"])
+            if info["count"] > 0:
+                try:
+                    scripts.ensure_source_backup(row["path"])
+                except Exception:
+                    pass
+                if not store.linked_sources(int(vid)):
+                    store.set_active_script(int(vid), int(vid))
             stats["scanned"] += 1
             if info["count"] <= 0:
                 stats["none"] += 1
@@ -327,13 +347,15 @@ def _discover(folders: list, cfg: AppConfig, store: Store, progress=None) -> dic
         row = store.get_by_path(str(p))
         if row is None:
             info = ffmpeg.probe(p)
-            store.upsert_video(
+            fs = _funscript_fields(p)
+            vid = store.upsert_video(
                 path=str(p), name=p.name, duration=info["duration"],
                 width=info["width"], height=info["height"], fps=info["fps"],
                 has_audio=int(bool(info["has_audio"])),
                 cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
-                **_funscript_fields(p),
+                **fs,
             )
+            _ensure_own_active(store, vid, int(fs["funscript_count"]) > 0)
             stats["added"] += 1
         elif row["status"] in ("ok", "no_pose"):
             stats["already"] += 1
@@ -364,13 +386,15 @@ def register_videos(paths: list, cfg: AppConfig, progress=None) -> dict:
             row = store.get_by_path(str(p))
             if row is None:
                 info = ffmpeg.probe(p)
-                store.upsert_video(
+                fs = _funscript_fields(p)
+                vid = store.upsert_video(
                     path=str(p), name=p.name, duration=info["duration"],
                     width=info["width"], height=info["height"], fps=info["fps"],
                     has_audio=int(bool(info["has_audio"])),
                     cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
-                    **_funscript_fields(p),
+                    **fs,
                 )
+                _ensure_own_active(store, vid, int(fs["funscript_count"]) > 0)
                 stats["added"] += 1
             elif row["status"] in ("ok", "no_pose"):
                 stats["already"] += 1

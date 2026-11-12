@@ -24,7 +24,7 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_file
 
-from . import config, ffmpeg, flow, funscript, pipeline, pose
+from . import config, ffmpeg, flow, funscript, pipeline, pose, scripts
 from .config import AppConfig
 from .db import Store
 
@@ -549,15 +549,16 @@ def video_detail(video_id):
     # funscript 详情
     fs_axes = []
     try:
-        for axis, path in funscript.find_for(row["path"]):
-            info = funscript.parse(path)
-            fs_axes.append({
-                "axis": axis,
-                "path": str(path),
-                "count": info["count"],
-                "duration_ms": info["duration_ms"],
-                "speed": info["speed"],
-            })
+        scan_info = funscript.scan(row["path"])
+        for f in scan_info["files"]:
+            for ax in f["axes"]:
+                fs_axes.append({
+                    "axis": ax,
+                    "path": f["path"],
+                    "count": f["count"],
+                    "duration_ms": f["duration_ms"],
+                    "speed": f["speed"],
+                })
     except Exception:
         pass
 
@@ -613,16 +614,145 @@ def funscript_detail(video_id):
         files = []
     axes = []
     for axis, path in files:
-        info = funscript.parse(path)
-        axes.append({
-            "axis": axis,
-            "path": str(path),
-            "count": info["count"],
-            "duration_ms": info["duration_ms"],
-            "speed": info["speed"],
-            "actions": info["actions"],
-        })
+        tracks = funscript.parse_tracks(path)
+        for ax, acts in tracks.items():
+            st = funscript._stats(acts)
+            axes.append({
+                "axis": ax,
+                "path": str(path),
+                "count": st["count"],
+                "duration_ms": st["duration_ms"],
+                "speed": st["speed"],
+                "actions": acts,
+            })
     return jsonify({"ok": True, "count": len(axes), "axes": axes})
+
+
+# ---------- 脚本管理 ----------
+@app.get("/api/scripts/<int:video_id>")
+def scripts_status(video_id):
+    row = _get_row(video_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    store = _store()
+    try:
+        linked = store.linked_sources(video_id)
+        src_ids = store.source_videos()
+        pool = []
+        for svid in src_ids:
+            srow = store.get_by_id(svid)
+            if not srow:
+                continue
+            pool.append({
+                "id": int(srow["id"]),
+                "name": srow["name"],
+                "music_group": int(srow["music_group"]) if srow["music_group"] is not None else None,
+                "dance_group": int(srow["dance_group"]) if srow["dance_group"] is not None else None,
+                "funscript_count": int(srow["funscript_count"] or 0),
+                "funscript_axes": json.loads(srow["funscript_axes"]) if srow["funscript_axes"] else [],
+                "status": srow["status"],
+            })
+    finally:
+        store.close()
+    active = next((s["source_video_id"] for s in linked if s["active"]), None)
+    linked_out = []
+    for s in linked:
+        srow = _get_row(s["source_video_id"])
+        linked_out.append({
+            "source_video_id": s["source_video_id"],
+            "active": s["active"],
+            "is_own": s["is_own"],
+            "name": srow["name"] if srow else f"#{s['source_video_id']}",
+        })
+    return jsonify({
+        "ok": True,
+        "active_source": active,
+        "own_source": scripts.has_source(row["path"]),
+        "linked": linked_out,
+        "pool": pool,
+        "music_group": int(row["music_group"]) if row["music_group"] is not None else None,
+        "dance_group": int(row["dance_group"]) if row["dance_group"] is not None else None,
+    })
+
+
+@app.post("/api/scripts/activate")
+def scripts_activate():
+    body = request.get_json(force=True, silent=True) or {}
+    vid = int(body.get("video_id", 0) or 0)
+    src = int(body.get("source_video_id", 0) or 0)
+    if not vid or not src:
+        return jsonify({"ok": False, "error": "参数缺失"}), 400
+    row = _get_row(vid)
+    srow = _get_row(src)
+    if row is None or srow is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    try:
+        scripts.activate(row["path"], srow["path"])
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"激活失败：{e}"}), 500
+    store = _store()
+    try:
+        store.set_active_script(vid, src)
+        info = funscript.scan(Path(row["path"]))
+        store.set_funscript(vid, info["count"], info["axes"])
+    finally:
+        store.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/scripts/import_source")
+def scripts_import_source():
+    body = request.get_json(force=True, silent=True) or {}
+    vid = int(body.get("video_id", 0) or 0)
+    path = (body.get("path") or "").strip()
+    if not vid or not path:
+        return jsonify({"ok": False, "error": "参数缺失"}), 400
+    row = _get_row(vid)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    try:
+        scripts.import_source(row["path"], path)
+        scripts.activate(row["path"], row["path"])
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"导入失败：{e}"}), 500
+    store = _store()
+    try:
+        store.set_active_script(vid, vid)
+        info = funscript.scan(Path(row["path"]))
+        store.set_funscript(vid, info["count"], info["axes"])
+    finally:
+        store.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/scripts/rescan")
+def scripts_rescan():
+    store = _store()
+    try:
+        rows = store.all_videos()
+    finally:
+        store.close()
+    stats = {"scanned": 0, "backed_up": 0}
+    for r in rows:
+        try:
+            info = funscript.scan(Path(r["path"]))
+            made = scripts.ensure_source_backup(r["path"])
+        except Exception:
+            continue
+        try:
+            store = _store()
+            try:
+                store.set_funscript(int(r["id"]), info["count"], info["axes"])
+                if info["count"] > 0 and not store.linked_sources(int(r["id"])):
+                    store.set_active_script(int(r["id"]), int(r["id"]))
+            finally:
+                store.close()
+        except Exception:
+            continue
+        stats["scanned"] += 1
+        if made:
+            stats["backed_up"] += 1
+    return jsonify({"ok": True, **stats})
 
 
 # ---------- 分组 ----------
@@ -1238,8 +1368,20 @@ INDEX_HTML = r"""<!doctype html>
   .msel-panel.open { display:block; }
   .msel-panel label { display:flex; gap:7px; align-items:center; padding:4px 8px; cursor:pointer; font-size:13px; border-radius:6px; }
   .msel-panel label:hover { background:#1c222d; }
+  .ss-item { display:flex; align-items:center; gap:10px; padding:8px; border:1px solid var(--line); border-radius:10px; cursor:pointer; }
+  .ss-item:hover { border-color: var(--ok); }
+  .ss-item img { width:96px; height:64px; object-fit:cover; border-radius:6px; background:#0a0d12; }
+  .ss-item .ss-info { flex:1; min-width:0; }
+  .ss-item .ss-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cmp-axis { display:flex; align-items:center; gap:8px; margin:4px 0; }
+  .cmp-axis .lbl { width:28px; font-size:12px; color:#8a93a6; }
+  .cmp-axis .bar { flex:1; height:14px; background:#141920; border-radius:7px; overflow:hidden; }
+  .cmp-axis .fill { height:100%; width:50%; border-radius:7px; transition:width .1s; }
+
   #detail-modal { z-index: 110; }
   #preview-modal { z-index: 120; }
+  #script-select-modal { z-index: 125; }
+  #compare-modal { z-index: 126; }
   .detail-box { width:min(880px, 94vw); }
   .detail-body { display:flex; gap:16px; align-items:flex-start; }
   .detail-thumb { width:300px; max-height:220px; object-fit:contain; border-radius:10px; background:#000; flex-shrink:0; }
@@ -1496,11 +1638,46 @@ INDEX_HTML = r"""<!doctype html>
     <div class="detail-body">
       <video id="detail-video" class="detail-thumb" controls playsinline preload="metadata"></video>
       <div class="detail-info" id="detail-info"></div>
+      <div class="panel" id="script-panel" style="margin-top:12px">
+        <b>脚本管理</b>
+        <div id="script-status" class="muted" style="margin-top:6px">加载中…</div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <button id="script-select-btn" class="ghost small">切换/关联脚本</button>
+          <button id="script-import-btn" class="ghost small">导入源脚本</button>
+        </div>
+      </div>
     </div>
     <div class="row" style="margin-top:14px">
       <button id="detail-preview">预览</button>
       <button id="detail-reextract" class="ghost">重新提取</button>
       <button id="detail-delete" class="ghost" style="color:var(--bad)">删除</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="script-select-modal" style="display:none">
+  <div class="modal-box" style="max-width:920px;max-height:90vh;display:flex;flex-direction:column">
+    <div class="modal-head"><b>选择源脚本</b><button class="ghost small" id="script-select-close">✕ 关闭</button></div>
+    <div class="row" style="gap:8px;flex-wrap:wrap;margin:10px 0">
+      <input id="ss-name" placeholder="文件名搜索" style="flex:1;min-width:140px;background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+      <select id="ss-music" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px"><option value="">全部音乐组</option></select>
+      <select id="ss-dance" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px"><option value="">全部动作组</option></select>
+    </div>
+    <div id="ss-list" style="overflow:auto;flex:1;display:flex;flex-direction:column;gap:8px"></div>
+  </div>
+</div>
+
+<div class="modal" id="compare-modal" style="display:none">
+  <div class="modal-box" style="max-width:1120px;max-height:92vh;overflow:auto">
+    <div class="modal-head"><b id="compare-name"></b><button class="ghost small" id="compare-close">✕ 关闭</button></div>
+    <div class="row" style="gap:10px;align-items:stretch">
+      <div class="panel" style="flex:1;min-width:0"><b>当前视频</b><video id="cmp-v1" controls playsinline style="width:100%;max-height:300px;background:#000"></video></div>
+      <div class="panel" style="flex:1;min-width:0"><b>源视频</b><video id="cmp-v2" controls playsinline style="width:100%;max-height:300px;background:#000"></video></div>
+    </div>
+    <div class="panel" style="margin-top:10px"><b>OSR6 虚拟播放</b><div id="cmp-osr6" style="height:320px;background:#0a0d12;border-radius:8px;overflow:hidden;margin-top:6px"></div></div>
+    <div class="panel" style="margin-top:10px"><div id="cmp-axes"></div></div>
+    <div class="row" style="margin-top:12px;justify-content:flex-end;gap:8px">
+      <button id="cmp-activate">激活此脚本</button>
     </div>
   </div>
 </div>
@@ -2400,6 +2577,7 @@ async function showDetail(id) {
     <div class="di-row"><span>分类</span><b>${(d.categories||[]).map(esc).join("、") || "-"}</b></div>
     <div class="di-row"><span>脚本</span><b>${d.funscript_count ? d.funscript_count + " 轴" : "无"}</b></div>
     ${fsLines}`;
+  loadScriptStatus(id);
   $("#detail-modal").style.display = "flex";
 }
 function closeDetail() {
@@ -2495,6 +2673,179 @@ document.getElementById("check-all").addEventListener("change", e => {
   const list = filteredVideos();
   if (e.target.checked) list.forEach(v=>st.sel.add(v.id)); else list.forEach(v=>st.sel.delete(v.id));
   renderVideos();
+});
+
+// ===== 脚本管理 =====
+let cmpEmu = null, cmpAxes = null, cmpSrcId = null;
+
+async function loadScriptStatus(id) {
+  const el = $("#script-status");
+  const d = await api("/api/scripts/" + id);
+  if (!d.ok) { el.textContent = "脚本数据获取失败"; return; }
+  st.scripts = d;
+  let html = "";
+  if (d.active_source != null) {
+    const a = d.linked.find(x => x.source_video_id === d.active_source);
+    const nm = a ? a.name : ("#" + d.active_source);
+    html += `<div class="di-row"><span>当前激活</span><b>${esc(nm)}${a && a.is_own ? "（自己的源）" : ""}</b></div>`;
+  } else {
+    html += `<div class="di-row"><span>当前激活</span><b>无脚本</b></div>`;
+  }
+  if (d.linked.length) {
+    html += `<div class="di-row"><span>关联源</span><b>${d.linked.map(x => esc(x.name) + (x.active ? " ★" : "")).join("、")}</b></div>`;
+  }
+  el.innerHTML = html;
+  $("#script-select-btn").textContent = (d.active_source != null) ? "切换脚本" : "关联脚本";
+  $("#script-import-btn").style.display = d.own_source ? "none" : "";
+}
+
+async function openScriptSelect() {
+  const d = st.scripts;
+  if (!d) return;
+  $("#script-select-modal").style.display = "flex";
+  const mus = [...new Set(d.pool.filter(p => p.music_group != null).map(p => p.music_group))].sort((a,b)=>a-b);
+  const dan = [...new Set(d.pool.filter(p => p.dance_group != null).map(p => p.dance_group))].sort((a,b)=>a-b);
+  $("#ss-music").innerHTML = `<option value="">全部音乐组</option>` + mus.map(g => `<option value="${g}">音乐组 ${g}</option>`).join("");
+  $("#ss-dance").innerHTML = `<option value="">全部动作组</option>` + dan.map(g => `<option value="${g}">动作组 ${g}</option>`).join("");
+  if (d.music_group != null) $("#ss-music").value = String(d.music_group);
+  renderScriptList();
+}
+
+function renderScriptList() {
+  const d = st.scripts;
+  if (!d) return;
+  const name = ($("#ss-name").value || "").toLowerCase();
+  const music = $("#ss-music").value, dance = $("#ss-dance").value;
+  const list = d.pool.filter(p => {
+    if (name && !p.name.toLowerCase().includes(name)) return false;
+    if (music && String(p.music_group) !== music) return false;
+    if (dance && String(p.dance_group) !== dance) return false;
+    return true;
+  });
+  const el = $("#ss-list");
+  if (!list.length) { el.innerHTML = `<div class="muted" style="padding:14px">没有匹配的源视频</div>`; return; }
+  el.innerHTML = list.map(p => `
+    <div class="ss-item">
+      <img src="/api/skeleton_gif/${p.id}" loading="lazy" onerror="this.style.visibility='hidden'">
+      <div class="ss-info">
+        <div class="ss-name">${esc(p.name)}</div>
+        <div class="muted" style="font-size:12px">${p.funscript_count} 轴 ${(p.funscript_axes||[]).map(esc).join("/")} · 音乐组 ${p.music_group ?? "-"} · 动作组 ${p.dance_group ?? "-"}</div>
+      </div>
+      <button class="ghost small" data-cmp="${p.id}">对比</button>
+      <button class="ghost small" data-act="${p.id}">激活</button>
+    </div>`).join("");
+  el.querySelectorAll("[data-act]").forEach(b => b.addEventListener("click", () => activateScript(+b.dataset.act)));
+  el.querySelectorAll("[data-cmp]").forEach(b => b.addEventListener("click", () => openCompare(+b.dataset.cmp)));
+}
+
+async function activateScript(srcId) {
+  const ok = await post("/api/scripts/activate", { video_id: st.detailId, source_video_id: srcId });
+  if (!ok.ok) { alert(ok.error || "激活失败"); return; }
+  $("#script-select-modal").style.display = "none";
+  await loadScriptStatus(st.detailId);
+  refreshLibrary();
+}
+
+async function importSource() {
+  const r = await post("/api/pick_files");
+  if (!r.ok) { if (r.error && r.error !== "已取消") alert(r.error); return; }
+  const path = r.paths && r.paths[0];
+  if (!path) return;
+  const ok = await post("/api/scripts/import_source", { video_id: st.detailId, path });
+  if (!ok.ok) { alert(ok.error || "导入失败"); return; }
+  await loadScriptStatus(st.detailId);
+  refreshLibrary();
+}
+
+async function openCompare(srcId) {
+  cmpSrcId = srcId;
+  const targetId = st.detailId;
+  $("#compare-modal").style.display = "flex";
+  $("#compare-name").textContent = "对比：当前视频 vs 源视频";
+  const v1 = $("#cmp-v1"), v2 = $("#cmp-v2");
+  v1.src = "/api/clip/" + targetId;
+  v2.src = "/api/clip/" + srcId;
+  const d = await api("/api/funscript/" + srcId);
+  cmpAxes = (d.axes || []).filter(a => a.actions && a.actions.length);
+  await initCmpEmu();
+  const sync = (from, to) => { try { to.currentTime = from.currentTime; } catch (e) {} };
+  v1.onplay = () => { sync(v1, v2); v2.play(); };
+  v2.onplay = () => { sync(v2, v1); v1.play(); };
+  v1.onpause = () => v2.pause();
+  v2.onpause = () => v1.pause();
+  v1.onseeked = () => sync(v1, v2);
+  v2.onseeked = () => sync(v2, v1);
+  function tick() {
+    if ($("#compare-modal").style.display === "none") return;
+    const t = (v1.currentTime || 0) * 1000;
+    const vals = sampleCmpAxes(t);
+    writeCmpEmu(vals);
+    drawCmpAxes(vals);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+function sampleCmpAxes(t) {
+  const vals = { L0: 50, L1: 50, L2: 50, R0: 50, R1: 50, R2: 50 };
+  for (const a of (cmpAxes || [])) {
+    const ax = (a.axis || "").toUpperCase();
+    if (!(ax in vals)) continue;
+    const acts = a.actions;
+    if (!acts || !acts.length) continue;
+    let lo = 0, hi = acts.length - 1, idx = 0;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (acts[m][0] <= t) { idx = m; lo = m + 1; } else hi = m - 1; }
+    vals[ax] = acts[idx][1];
+  }
+  return vals;
+}
+
+async function initCmpEmu() {
+  const el = $("#cmp-osr6");
+  if (cmpEmu) return;
+  try {
+    const mod = await import("/vendor/osr-emu/osr-emu.dist.module.min.js");
+    cmpEmu = new mod.OSREmulator(el, { model: "SR6" });
+  } catch (e) {
+    el.innerHTML = `<div class="muted" style="padding:14px">模拟器加载失败</div>`;
+  }
+}
+
+function writeCmpEmu(vals) {
+  if (!cmpEmu) return;
+  const AXES = ["L0", "L1", "L2", "R0", "R1", "R2"];
+  const cmd = AXES.map(a => {
+    const n = Math.max(0, Math.min(9999, Math.round((vals[a] || 50) * 99.99)));
+    return a + String(n).padStart(4, "0") + "I50";
+  }).join(" ") + "\n";
+  try { cmpEmu.write(cmd); } catch (e) {}
+}
+
+function drawCmpAxes(vals) {
+  const colors = { L0: "#5b8cff", L1: "#4bd08a", L2: "#ffb454", R0: "#ff6b6b", R1: "#b48cff", R2: "#e88cff" };
+  $("#cmp-axes").innerHTML = Object.keys(colors).map(a => `
+    <div class="cmp-axis">
+      <div class="lbl">${a}</div>
+      <div class="bar"><div class="fill" style="width:${vals[a]}%;background:${colors[a]}"></div></div>
+      <div class="lbl" style="width:34px;text-align:right">${Math.round(vals[a])}</div>
+    </div>`).join("");
+}
+
+function closeCompare() {
+  const v1 = $("#cmp-v1"), v2 = $("#cmp-v2");
+  try { v1.pause(); v2.pause(); } catch (e) {}
+  $("#compare-modal").style.display = "none";
+}
+
+$("#script-select-btn").addEventListener("click", openScriptSelect);
+$("#script-import-btn").addEventListener("click", importSource);
+$("#script-select-close").addEventListener("click", () => { $("#script-select-modal").style.display = "none"; });
+$("#ss-name").addEventListener("input", renderScriptList);
+$("#ss-music").addEventListener("change", renderScriptList);
+$("#ss-dance").addEventListener("change", renderScriptList);
+$("#compare-close").addEventListener("click", closeCompare);
+$("#cmp-activate").addEventListener("click", () => {
+  if (cmpSrcId) { closeCompare(); activateScript(cmpSrcId); }
 });
 
 async function refreshLibrary() {

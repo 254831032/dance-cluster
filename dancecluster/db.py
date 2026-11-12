@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS pair_cache (
     value REAL    NOT NULL,
     PRIMARY KEY (a_id, b_id, kind)
 );
+
+CREATE TABLE IF NOT EXISTS video_scripts (
+    video_id        INTEGER NOT NULL,
+    source_video_id INTEGER NOT NULL,
+    active          INTEGER DEFAULT 0,
+    created_at      TEXT,
+    PRIMARY KEY (video_id, source_video_id)
+);
 """
 
 
@@ -196,6 +204,45 @@ class Store:
             "UPDATE videos SET motion_npz = ?, present_ratio = ?, updated_at = ? WHERE id = ?",
             (dumps_npz(motion), float(present_ratio), _now(), video_id),
         )
+        self.conn.commit()
+
+    def set_active_script(self, video_id: int, source_video_id: int) -> None:
+        """记录 video 当前激活的源脚本，并清掉其它 active 标记。"""
+        self.conn.execute(
+            "UPDATE video_scripts SET active = 0 WHERE video_id = ?", (video_id,)
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO video_scripts (video_id, source_video_id, active, created_at) "
+            "VALUES (?, ?, 1, ?)",
+            (video_id, source_video_id, _now()),
+        )
+        self.conn.commit()
+
+    def linked_sources(self, video_id: int) -> list[dict]:
+        """返回某视频关联的源列表 [{source_video_id, active, is_own}]。"""
+        rows = self.conn.execute(
+            "SELECT source_video_id, active FROM video_scripts WHERE video_id = ? "
+            "ORDER BY active DESC, source_video_id",
+            (video_id,),
+        ).fetchall()
+        return [
+            {
+                "source_video_id": int(r["source_video_id"]),
+                "active": bool(r["active"]),
+                "is_own": int(r["source_video_id"]) == int(video_id),
+            }
+            for r in rows
+        ]
+
+    def source_videos(self) -> list[int]:
+        """所有「源视频」的 id（有源脚本备份，且已登记关联关系的）。"""
+        rows = self.conn.execute(
+            "SELECT DISTINCT source_video_id FROM video_scripts"
+        ).fetchall()
+        return sorted({int(r["source_video_id"]) for r in rows})
+
+    def clear_scripts(self, video_id: int) -> None:
+        self.conn.execute("DELETE FROM video_scripts WHERE video_id = ?", (video_id,))
         self.conn.commit()
 
     def set_funscript(self, video_id: int, count: int, axes: list) -> None:
