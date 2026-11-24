@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,15 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 # 限制视频编码线程数，避免并行识别时多个 ffmpeg 各自用满所有核把 CPU 拉满。
 # 可用环境变量 DANCECLUSTER_FFMPEG_THREADS 覆盖（如 "1"）。
 _MAX_THREADS = os.environ.get("DANCECLUSTER_FFMPEG_THREADS", "2")
+
+# 全局 ffmpeg/ffprobe 并发上限：多 worker 并行时，同时只允许这么多 ffmpeg 进程在跑，
+# 从源头避免 CPU/GPU 打满，以及 NVENC 会话数超限导致的「打开编码器失败」。
+# 可用环境变量 DANCECLUSTER_FFMPEG_CONCURRENCY 覆盖（默认 3）。
+try:
+    _FFMPEG_CONCURRENCY = max(1, int(os.environ.get("DANCECLUSTER_FFMPEG_CONCURRENCY", "3")))
+except ValueError:
+    _FFMPEG_CONCURRENCY = 3
+_FFMPEG_SLOTS = threading.Semaphore(_FFMPEG_CONCURRENCY)
 
 _nvenc_cache: bool | None = None
 
@@ -71,7 +81,8 @@ def ffprobe() -> str:
 
 
 def _run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
+    with _FFMPEG_SLOTS:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-8:])
         raise RuntimeError(f"命令失败({proc.returncode}): {' '.join(cmd)}\n{tail}")
