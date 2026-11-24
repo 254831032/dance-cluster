@@ -420,7 +420,11 @@ def register_videos(paths: list, cfg: AppConfig, progress=None) -> dict:
 
 
 def _worker_count(n: int) -> int:
-    """并行度：默认 CPU 一半、最多 4；可用环境变量 DANCECLUSTER_WORKERS 覆盖。"""
+    """并行度：默认 CPU 一半、最多 8；可用环境变量 DANCECLUSTER_WORKERS 覆盖。
+
+    NVENC 把重编码搬到 GPU 后，CPU 只做解码/音频特征，能支撑更多并行 worker 提速。
+    20 核机器默认 8 路。想更省资源或更快，用 DANCECLUSTER_WORKERS 调。
+    """
     env = os.environ.get("DANCECLUSTER_WORKERS")
     if env:
         try:
@@ -431,7 +435,7 @@ def _worker_count(n: int) -> int:
         cpu = os.cpu_count() or 4
     except Exception:
         cpu = 4
-    return max(1, min(4, cpu // 2, n))
+    return max(1, min(8, cpu // 2, n))
 
 
 def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None, with_pose: bool = True) -> list[Record]:
