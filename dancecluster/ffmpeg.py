@@ -151,7 +151,7 @@ def cut_clip(
         # NVENC 优先；失败（会话数超限/分辨率不支持等）自动回退软编
         if _nvenc_available():
             try:
-                _run(base + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-b:v", "0"] + tail)
+                _run(base + ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"] + tail)
                 return out
             except RuntimeError:
                 pass
