@@ -324,7 +324,7 @@ def _run_job(params: dict) -> None:
 
         before = _counts(_store())
         _log(f"开始提取（待处理 {before['pending']} 个，已完成 {before['done']} 个将跳过）…")
-        records = pipeline.process_pending(cfg, progress=progress, only_ids=params.get("ids"))
+        records = pipeline.process_pending(cfg, progress=progress, only_ids=params.get("ids"), with_pose=False)
         if _state["cancel"]:
             raise _Cancelled()
         _log("提取完成，正在分组…")
@@ -351,6 +351,61 @@ def _run_job(params: dict) -> None:
     finally:
         with _lock:
             _state["running"] = False
+
+
+def _start_dance_job(ids: list[int]) -> str | None:
+    """动作分组后台任务。"""
+    with _lock:
+        if _state["running"]:
+            return "有任务正在运行，请稍候或先取消"
+        _state.update(running=True, progress=0, total=len(ids), stage="动作分组",
+                      name="", log=[], error="", cancel=False)
+
+    def _run():
+        def progress(i, total, name, stage):
+            with _lock:
+                _state.update(progress=i, total=total, name=name, stage=stage)
+        try:
+            res = pipeline.submit_dance_group(ids, _cfg(), progress=progress)
+            if not res.get("ok"):
+                _log(f"动作分组失败：{res.get('error')}")
+            else:
+                _log(f"动作分组完成：{res.get('grouped')}/{res.get('total')} 个有骨架")
+            with _lock:
+                _state["stage"] = "完成"
+        except Exception:
+            tb = traceback.format_exc()
+            _log(tb)
+            with _lock:
+                _state["stage"] = "出错"
+                _state["error"] = tb
+        finally:
+            with _lock:
+                _state["running"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return None
+
+
+@app.post("/api/dance/submit")
+def dance_submit():
+    body = request.get_json(force=True, silent=True) or {}
+    ids = [int(x) for x in body.get("ids", [])]
+    if not ids:
+        return jsonify({"ok": False, "error": "请选择视频"}), 400
+    store = _store()
+    try:
+        rows = [store.get_by_id(i) for i in ids]
+        bad = [r for r in rows if not r or r["status"] not in ("ok", "no_pose")]
+    finally:
+        store.close()
+    if bad:
+        return jsonify({"ok": False,
+                        "error": f"{len(bad)} 个视频尚未完成主流程，不能提交动作分组"}), 400
+    err = _start_dance_job(ids)
+    if err:
+        return jsonify({"ok": False, "error": err}), 409
+    return jsonify({"ok": True})
 
 
 # ---------- 页面 ----------
@@ -451,6 +506,9 @@ def library():
                 "dance_name": dance_names.get(r["dance_group"], f"D{r['dance_group']}") if r["dance_group"] is not None else None,
                 "funscript_count": int(r["funscript_count"] or 0),
                 "funscript_axes": json.loads(r["funscript_axes"]) if r["funscript_axes"] else [],
+                "dance_grouped": int(r["dance_grouped"] or 0),
+                "music_state": int(r["music_state"] or 0),
+                "dance_state": int(r["dance_state"] or 0),
             }
             for r in store.all_videos()
         ]
@@ -574,6 +632,8 @@ def video_detail(video_id):
         "height": int(row["height"] or 0),
         "fps": round(float(row["fps"] or 0), 2),
         "status": row["status"],
+        "music_state": int(row["music_state"] or 0),
+        "dance_state": int(row["dance_state"] or 0),
         "tempo": round(float(row["tempo"] or 0), 1),
         "confidence": round(float(row["confidence"]), 3) if row["confidence"] is not None else None,
         "present_ratio": round(float(row["present_ratio"] or 0), 3),
@@ -1325,6 +1385,9 @@ INDEX_HTML = r"""<!doctype html>
   .card .meta { padding:8px 9px; }
   .card .name { font-size:12px; word-break:break-all; }
   .card .badges { margin-top:4px; display:flex; gap:4px; flex-wrap:wrap; }
+  .card .grp-badges { margin-top:3px; display:flex; flex-direction:column; gap:2px; }
+  .card .grp-badges .badge { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+  #tooltip { position:fixed; display:none; z-index:9999; max-width:360px; background:#0e1116; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-size:12px; line-height:1.5; box-shadow:0 8px 24px rgba(0,0,0,.5); pointer-events:none; word-break:break-all; }
   .badge { font-size:11px; border-radius:5px; padding:1px 6px; background:#1c222d; color:var(--dim); }
   .badge.np { color:var(--bad); }
   .badge.fs-none { color:var(--dim); }
@@ -1508,6 +1571,7 @@ INDEX_HTML = r"""<!doctype html>
           <button id="btn-assign" class="ghost small">归入分类</button>
           <button id="btn-preview" class="ghost small">预览</button>
           <button id="btn-scan-fs" class="ghost small">扫描脚本</button>
+          <button id="btn-dance-group" class="ghost small">提交动作分组</button>
           <button id="btn-reextract" class="ghost small">重新提取</button>
           <button id="btn-delete" class="ghost small" style="color:var(--bad)">删除</button>
         </div>
@@ -1689,6 +1753,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<div id="tooltip"></div>
 <script>
 const $ = s => document.querySelector(s);
 const st = { configured:false, view:"list", thumbSize:"m", anim:true, filterCat:null, timer:null, videos:[], cats:[], sel:new Set(), selFolders:new Set(), search:"", fMusic:new Set(), fDance:new Set(), fStatus:"all", fsLevel:"all", fsAxes:[], fsMaxAt:1, cacheDir:"", detailId:null, running:false };
@@ -1712,6 +1777,12 @@ function observeThumb(v) { if (v) _thumbObs.observe(v); }
 function statusBadge(s) {
   const m = {ok:["done","识别完成"], no_pose:["np","无骨架"], extracting:["extracting","识别中"], pending:["","待识别"], error:["np","出错"]}[s]||["",""];
   return `<span class="badge ${m[0]}">${m[1]||s}</span>`;
+}
+function stateBadge(label, state) {
+  const v = parseInt(state || 0);
+  const cls = v >= 2 ? "done" : (v === 1 ? "extracting" : "np");
+  const txt = v >= 2 ? "完成" : (v === 1 ? "提取中" : "未提取");
+  return `<span class="badge ${cls}">${label}·${txt}</span>`;
 }
 function confirm2(first, second) {
   if (!confirm(first)) return false;
@@ -1909,6 +1980,14 @@ document.getElementById("btn-scan-fs").addEventListener("click", async () => {
   if (!r.ok) { alert(r.error || "扫描失败"); return; }
   alert(`扫描 ${r.scanned} 个视频\n有脚本 ${r.with_script} 个（单轴 ${r.single}、多轴 ${r.multi}）\n无脚本 ${r.none} 个`);
   refreshLibrary();
+});
+document.getElementById("btn-dance-group").addEventListener("click", async () => {
+  const ids = [...st.sel];
+  if (!ids.length) { alert("请先勾选视频"); return; }
+  const r = await post("/api/dance/submit", { ids });
+  if (!r.ok) { alert(r.error || "提交失败"); return; }
+  alert("已提交动作分组，后台处理中…");
+  poll();
 });
 document.getElementById("btn-preview").addEventListener("click", () => {
   if (st.sel.size !== 1) { alert("请先选中一个视频（单选）进行预览"); return; }
@@ -2569,7 +2648,8 @@ async function showDetail(id) {
     <div class="di-row"><span>路径</span><b>${esc(d.path)}</b></div>
     <div class="di-row"><span>分辨率</span><b>${d.width}×${d.height} @ ${d.fps}fps</b></div>
     <div class="di-row"><span>时长</span><b>${d.duration}s</b></div>
-    <div class="di-row"><span>状态</span><b>${statusBadge(d.status)}</b></div>
+    <div class="di-row"><span>音乐</span><b>${stateBadge("音乐", d.music_state)}</b></div>
+    <div class="di-row"><span>动作</span><b>${stateBadge("动作", d.dance_state)}</b></div>
     <div class="di-row"><span>音乐组</span><b>${esc(d.music_name || "-")}</b></div>
     <div class="di-row"><span>动作组</span><b>${esc(d.dance_name || "-")}</b></div>
     <div class="di-row"><span>BPM</span><b>${d.tempo || "-"}</b></div>
@@ -2848,6 +2928,28 @@ $("#cmp-activate").addEventListener("click", () => {
   if (cmpSrcId) { closeCompare(); activateScript(cmpSrcId); }
 });
 
+// ===== 自定义悬浮提示 =====
+(function () {
+  const tip = document.getElementById("tooltip");
+  if (!tip) return;
+  document.addEventListener("mouseover", e => {
+    const t = e.target.closest("[data-tip]");
+    if (!t) return;
+    tip.textContent = t.getAttribute("data-tip");
+    tip.style.display = "block";
+    const r = t.getBoundingClientRect();
+    let left = Math.min(window.innerWidth - 20 - tip.offsetWidth, r.left);
+    if (left < 8) left = 8;
+    let top = r.bottom + 6;
+    if (top + tip.offsetHeight > window.innerHeight - 8) top = r.top - tip.offsetHeight - 6;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  });
+  document.addEventListener("mouseout", e => {
+    if (e.target.closest("[data-tip]")) tip.style.display = "none";
+  });
+})();
+
 async function refreshLibrary() {
   const d = await api("/api/library");
   if (d.configured===false) { st.configured=false; applyGate(); return; }
@@ -2983,9 +3085,9 @@ function listTable(list) {
       <td><img class="thumb-sm" src="/api/thumb/${v.id}"></td>
       <td><span class="list-name">${esc(v.name)}</span></td><td>${v.duration}s</td>
       <td>${v.music_name||"-"}</td>
-      <td>${v.dance_name||"-"}</td>
+      <td>${v.dance_grouped ? (v.dance_name||"已分组") : (["ok","no_pose"].includes(v.status) ? '<span class="muted">未分组</span>' : "-")}</td>
       <td>${funscriptBadge(v)}</td>
-      <td>${statusBadge(v.status)}</td>`;
+      <td>${stateBadge("音乐", v.music_state)} ${stateBadge("动作", v.dance_state)}</td>`;
     tr.addEventListener("click", e => {
       if (e.target.dataset.cb === "") {
         toggleSel(v.id);
@@ -3022,7 +3124,7 @@ function gridCard(v) {
       <div class="hover-btns"><button data-kind="orig">原片</button><button data-kind="skel">骨架</button><button data-kind="clip">片段</button></div>
     </div>
     <div class="meta"><div class="name">${esc(v.name)}</div>
-    <div class="badges">${statusBadge(v.status)}${funscriptBadge(v)}${v.music_name?`<span class="badge">${esc(v.music_name)}</span>`:""}${v.dance_name?`<span class="badge">${esc(v.dance_name)}</span>`:""}</div></div>`;
+    <div class="badges">${stateBadge("音乐", v.music_state)}${stateBadge("动作", v.dance_state)}${funscriptBadge(v)}</div>${(v.music_name||v.dance_name)?`<div class="grp-badges">${v.music_name?`<span class="badge grp" data-tip="音乐:${esc(v.music_name)}">音乐:${esc(v.music_name)}</span>`:""}${v.dance_name?`<span class="badge grp" data-tip="动作:${esc(v.dance_name)}">动作:${esc(v.dance_name)}</span>`:""}</div>`:""}</div>`;
   d.querySelector(".hover-btns").addEventListener("click", e => {
     e.stopPropagation();
     const btn = e.target.closest("button");

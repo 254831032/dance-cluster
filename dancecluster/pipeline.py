@@ -102,6 +102,7 @@ def index_video(
     store: Store,
     landmarker=None,
     ts_offset_ms: float = 0.0,
+    with_pose: bool = True,
 ) -> Record:
     cdir = _cache_dir(cfg, path.stem)
     info = ffmpeg.probe(path)
@@ -115,6 +116,10 @@ def index_video(
         width=info["width"], height=info["height"], fps=info["fps"],
         has_audio=bool(info["has_audio"]), cache=str(cdir),
     )
+    try:
+        store.set_music_state(vid, 1)
+    except Exception:
+        pass
 
     try:
         # 1) 切片段（留档，便于人工核对与后续调参）
@@ -155,45 +160,54 @@ def index_video(
                 tempo=afeat["tempo"],
             )
 
-        # 3) 骨架特征
-        seq = pose.extract_pose(
-            str(clip), cfg.pose.model_file(),
-            num_poses=cfg.pose.num_poses,
-            analysis_fps=max(cfg.pose.target_fps, 10.0),
-            min_detection_confidence=cfg.pose.min_detection_confidence,
-            min_presence_confidence=cfg.pose.min_presence_confidence,
-            min_tracking_confidence=cfg.pose.min_tracking_confidence,
-            smooth_window=cfg.pose.smooth_window,
-            landmarker=landmarker,
-            ts_offset_ms=ts_offset_ms,
-        )
-        seq.save(cdir / "pose.npz")
-        feat, feat_mirror = features.prepare_features(
-            seq.world, seq.visibility, seq.present, seq.fps,
-            target_fps=cfg.pose.target_fps, min_visibility=cfg.pose.min_visibility,
-        )
-        present_ratio = float(seq.present.mean())
-        # 要求「大部分时间都有人」，否则宁可不比，避免把零星误检当成动作
-        if present_ratio < 0.35 or feat.shape[0] < 30:
-            rec.status = "no_pose"
-            rec.error = f"人体检测不稳定（present={present_ratio:.0%}, frames={feat.shape[0]}）"
-        else:
-            store.set_motion(
-                vid,
-                {
-                    "feat": feat,
-                    "feat_mirror": feat_mirror,
-                    "fps": np.array(cfg.pose.target_fps),
-                    "present_ratio": np.array(present_ratio),
-                    "shots": np.array(seq.shots, dtype=np.float32).reshape(-1, 2),
-                },
-                present_ratio=present_ratio,
+        # 3) 骨架特征（可选；主流程只做音频时跳过，动作分组时再补）
+        if with_pose:
+            # 3) 骨架特征
+            seq = pose.extract_pose(
+                str(clip), cfg.pose.model_file(),
+                num_poses=cfg.pose.num_poses,
+                analysis_fps=max(cfg.pose.target_fps, 10.0),
+                min_detection_confidence=cfg.pose.min_detection_confidence,
+                min_presence_confidence=cfg.pose.min_presence_confidence,
+                min_tracking_confidence=cfg.pose.min_tracking_confidence,
+                smooth_window=cfg.pose.smooth_window,
+                landmarker=landmarker,
+                ts_offset_ms=ts_offset_ms,
             )
-            rec.status = "ok"
+            seq.save(cdir / "pose.npz")
+            feat, feat_mirror = features.prepare_features(
+                seq.world, seq.visibility, seq.present, seq.fps,
+                target_fps=cfg.pose.target_fps, min_visibility=cfg.pose.min_visibility,
+            )
+            present_ratio = float(seq.present.mean())
+            # 要求「大部分时间都有人」，否则宁可不比，避免把零星误检当成动作
+            if present_ratio < 0.35 or feat.shape[0] < 30:
+                rec.status = "no_pose"
+                rec.error = f"人体检测不稳定（present={present_ratio:.0%}, frames={feat.shape[0]}）"
+            else:
+                store.set_motion(
+                    vid,
+                    {
+                        "feat": feat,
+                        "feat_mirror": feat_mirror,
+                        "fps": np.array(cfg.pose.target_fps),
+                        "present_ratio": np.array(present_ratio),
+                        "shots": np.array(seq.shots, dtype=np.float32).reshape(-1, 2),
+                    },
+                    present_ratio=present_ratio,
+                )
+                rec.status = "ok"
+        else:
+            rec.status = "ok"   # 主流程完成（切片+音频），骨架待动作分组时提取
     except Exception as exc:  # 单个失败不拖垮整批
         rec.status = "error"
         rec.error = f"{type(exc).__name__}: {exc}"
 
+    if rec.status == "error":
+        try:
+            store.set_music_state(vid, 0)
+        except Exception:
+            pass
     store.set_status(vid, rec.status, rec.error, feature_version=FEATURE_VERSION)
     return rec
 
@@ -412,7 +426,7 @@ def _worker_count(n: int) -> int:
     return max(1, min(4, cpu // 2, n))
 
 
-def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None) -> list[Record]:
+def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None, with_pose: bool = True) -> list[Record]:
     """处理待提取（pending/error）的视频；only_ids 指定只处理选中的。
 
     多个视频时用线程池并行（每个 worker 独立 SQLite 连接 + 独立 PoseLandmarker），
@@ -465,7 +479,7 @@ def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None)
                 if stop.is_set():
                     break
                 video = Path(row["path"])
-                rec = index_video(video, cfg, s, landmarker=lm, ts_offset_ms=ts)
+                rec = index_video(video, cfg, s, landmarker=lm, ts_offset_ms=ts, with_pose=with_pose)
                 ts += (rec.duration + 1.0) * 1000.0
                 with lock:
                     records.append(rec)
@@ -604,33 +618,180 @@ def group(records: list[Record], cfg: AppConfig) -> Result:
         music_labels = clustering.cluster_from_distances(
             1.0 - music_sim, threshold=1.0 - cfg.match.music_threshold
         )
-        dance_dist = _dance_matrix(motions, tempos, music_labels, ids, cfg, store)
-        dance_labels = _cluster_per_group(dance_dist, music_labels, cfg.match.dance_threshold)
-        conf = _confidence(dance_dist, dance_labels)
-
-        # 没有动作特征（未检测到骨架）的视频不参与动作分组
-        has_motion = np.array(["feat" in m for m in motions], dtype=bool)
-        dance_labels = np.where(has_motion, dance_labels, 0)
-        conf = np.where(has_motion, conf, 0.0)
-
-        store.set_groups([
-            (records[i].id, int(music_labels[i]),
-             int(dance_labels[i]) if dance_labels[i] > 0 else None,
-             float(conf[i]) if dance_labels[i] > 0 else None)
-            for i in range(len(records))
-        ])
+        store.set_music_groups([(records[i].id, int(music_labels[i])) for i in range(len(records))])
+        for i, rec in enumerate(records):
+            try:
+                store.set_music_state(rec.id, 2 if audios[i] is not None else 0)
+            except Exception:
+                pass
         store.ensure_groups("music", set(int(x) for x in music_labels))
-        store.ensure_groups("dance", set(int(x) for x in dance_labels if x > 0))
         return Result(
             records=records,
             music_sim=music_sim,
             music_labels=music_labels,
-            dance_dist=dance_dist,
-            dance_labels=dance_labels,
+            dance_dist=np.zeros((0, 0), np.float32),
+            dance_labels=np.zeros(len(records), np.int32),
             tempo=tempos,
-            confidence=conf,
+            confidence=np.zeros(len(records), np.float32),
             db_path=str(db_path(cfg)),
         )
+    finally:
+        store.close()
+
+
+def _ensure_pose_and_motion(row: dict, cfg: AppConfig, store: Store) -> bool:
+    """确保某个视频的骨架 + 动作特征都存在（动作分组前调用）。"""
+    vid = int(row["id"])
+    cdir = Path(row["cache_dir"])
+    pose_npz = cdir / "pose.npz"
+    if not pose_npz.exists():
+        ensure_video_cache(row, cfg)
+    fresh = store.get_by_id(vid)
+    if fresh is None:
+        return False
+    if fresh.get("motion_npz"):
+        return True
+    if not pose_npz.exists():
+        return False
+    seq = pose.PoseSequence.load(pose_npz)
+    feat, feat_mirror = features.prepare_features(
+        seq.world, seq.visibility, seq.present, seq.fps,
+        target_fps=cfg.pose.target_fps, min_visibility=cfg.pose.min_visibility,
+    )
+    present_ratio = float(seq.present.mean())
+    if present_ratio < 0.35 or feat.shape[0] < 30:
+        store.set_status(vid, "no_pose", f"人体检测不稳定（present={present_ratio:.0%}）")
+        return False
+    store.set_motion(
+        vid,
+        {
+            "feat": feat,
+            "feat_mirror": feat_mirror,
+            "fps": np.array(cfg.pose.target_fps),
+            "present_ratio": np.array(present_ratio),
+            "shots": np.array(seq.shots, dtype=np.float32).reshape(-1, 2),
+        },
+        present_ratio=present_ratio,
+    )
+    return True
+
+
+def submit_dance_group(ids: list[int], cfg: AppConfig, progress=None) -> dict:
+    """手动提交动作分组：提骨架 → 与「已有动作组」比对 → 归组/新建组。"""
+    store = Store(db_path(cfg))
+    try:
+        submitted = []
+        for vid in ids:
+            row = store.get_by_id(int(vid))
+            if row and row["status"] in ("ok", "no_pose"):
+                submitted.append(row)
+        if not submitted:
+            return {"ok": False, "error": "没有主流程已完成的视频"}
+        sub_ids = {int(r["id"]) for r in submitted}
+
+        # 1) 确保骨架
+        total = len(submitted)
+        for i, row in enumerate(submitted):
+            if progress:
+                progress(i, total, row["name"], "动作分组·提取骨架")
+            try:
+                store.set_dance_state(int(row["id"]), 1)
+            except Exception:
+                pass
+            try:
+                _ensure_pose_and_motion(row, cfg, store)
+            except Exception:
+                try:
+                    store.set_dance_state(int(row["id"]), 0)
+                except Exception:
+                    pass
+
+        sub_rows = [store.get_by_id(int(r["id"])) for r in submitted]
+        sub_rows = [r for r in sub_rows if r]
+        if not sub_rows:
+            return {"ok": False, "error": "没有可处理的视频"}
+        sub_motions = [store.motion_features(r) if r.get("motion_npz") else {} for r in sub_rows]
+        sub_music = [int(r["music_group"]) if r["music_group"] is not None else 0 for r in sub_rows]
+        sub_tempos = [float(r["tempo"] or 0) for r in sub_rows]
+
+        # 2) 已有动作组（参考集）：已分组 + 有动作特征 + 不在本次提交里
+        all_rows = store.all_videos()
+        # 参考集：所有已分组的（含本次提交里已分组的，使其能匹配回自己的组）
+        ref = [r for r in all_rows
+               if int(r["dance_grouped"] or 0) == 1
+               and r.get("motion_npz")]
+        ref_motions = [store.motion_features(r) for r in ref]
+        ref_music = [int(r["music_group"]) if r["music_group"] is not None else 0 for r in ref]
+        ref_tempos = [float(r["tempo"] or 0) for r in ref]
+        ref_groups = [int(r["dance_group"]) for r in ref]
+
+        threshold = float(cfg.match.dance_threshold)
+        assigned: list[int | None] = [None] * len(sub_rows)
+
+        # 3) 与已有组比对（同音乐组 + BPM 不冲突）
+        if progress:
+            progress(total, total, "", "动作分组·比对已有组")
+        for i, m in enumerate(sub_motions):
+            if "feat" not in m:
+                continue
+            best_d, best_g = float("inf"), None
+            for j, rm in enumerate(ref_motions):
+                if "feat" not in rm or ref_music[j] != sub_music[i]:
+                    continue
+                if _tempo_conflict(sub_tempos[i], ref_tempos[j]):
+                    continue
+                cached = store.get_pair(int(sub_rows[i]["id"]), int(ref[j]["id"]), "dance")
+                if cached is not None:
+                    d = cached
+                else:
+                    d = dtw.distance(
+                        m["feat"], rm["feat"], rm["feat_mirror"],
+                        window_ratio=cfg.match.dtw_window_ratio,
+                        mirror_invariant=cfg.match.mirror_invariant,
+                    )
+                    store.set_pair(int(sub_rows[i]["id"]), int(ref[j]["id"]), "dance", float(d))
+                if d < best_d:
+                    best_d, best_g = d, ref_groups[j]
+            if best_g is not None and best_d <= threshold:
+                assigned[i] = best_g
+
+        # 4) 没匹配上的：在提交集合内（同音乐组）聚类，分配新组号
+        max_group = max((int(r["dance_group"]) for r in all_rows if r["dance_group"] is not None), default=0)
+        unmatched = [i for i in range(len(sub_rows))
+                     if assigned[i] is None and "feat" in sub_motions[i]]
+        if unmatched:
+            u_motions = [sub_motions[i] for i in unmatched]
+            u_music = np.array([sub_music[i] for i in unmatched], dtype=np.int32)
+            u_ids = [int(sub_rows[i]["id"]) for i in unmatched]
+            u_tempos = np.array([sub_tempos[i] for i in unmatched], dtype=np.float32)
+            D = _dance_matrix(u_motions, u_tempos, u_music, u_ids, cfg, store)
+            labels = _cluster_per_group(D, u_music, threshold)
+            remap: dict[int, int] = {}
+            next_g = max_group + 1
+            for k, i in enumerate(unmatched):
+                lab = int(labels[k])
+                if lab <= 0:
+                    continue
+                if lab not in remap:
+                    remap[lab] = next_g
+                    next_g += 1
+                assigned[i] = remap[lab]
+
+        # 5) 写回
+        assignments = []
+        for i, row in enumerate(sub_rows):
+            g = assigned[i]
+            assignments.append((int(row["id"]), g, 1.0 if g is not None else 0.0, 1 if g is not None else 0))
+        store.set_dance_groups(assignments)
+        for i, row in enumerate(sub_rows):
+            try:
+                store.set_dance_state(int(row["id"]), 2 if assigned[i] is not None else 0)
+            except Exception:
+                pass
+        store.ensure_groups("dance", set(int(a[1]) for a in assignments if a[1] is not None))
+        grouped = sum(1 for a in assigned if a is not None)
+        return {"ok": True, "total": len(sub_rows), "grouped": grouped,
+                "matched": sum(1 for i in range(len(assigned)) if assigned[i] is not None and i not in unmatched)}
     finally:
         store.close()
 

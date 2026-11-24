@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS videos (
     feature_version INTEGER DEFAULT 0,
     funscript_count INTEGER DEFAULT 0,
     funscript_axes  TEXT,
+    dance_grouped   INTEGER DEFAULT 0,
+    music_state     INTEGER DEFAULT 0,
+    dance_state     INTEGER DEFAULT 0,
     updated_at    TEXT
 );
 
@@ -143,12 +146,29 @@ class Store:
             ("feature_version", "INTEGER DEFAULT 0"),
             ("funscript_count", "INTEGER DEFAULT 0"),
             ("funscript_axes", "TEXT"),
+            ("dance_grouped", "INTEGER DEFAULT 0"),
+            ("music_state", "INTEGER DEFAULT 0"),
+            ("dance_state", "INTEGER DEFAULT 0"),
         ):
             if col not in cols:
                 try:
                     self.conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {ddl}")
                 except sqlite3.OperationalError:
                     pass
+        # 老库回填：已有音频+音乐组 → 音乐完成；已有动作组 → 动作完成 + dance_grouped=1
+        try:
+            self.conn.execute(
+                "UPDATE videos SET music_state=2 WHERE music_state=0 "
+                "AND audio_npz IS NOT NULL AND music_group IS NOT NULL"
+            )
+            self.conn.execute(
+                "UPDATE videos SET dance_grouped=1 WHERE dance_grouped=0 AND dance_group IS NOT NULL"
+            )
+            self.conn.execute(
+                "UPDATE videos SET dance_state=2 WHERE dance_state=0 AND dance_grouped=1"
+            )
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def close(self) -> None:
@@ -250,6 +270,30 @@ class Store:
         self.conn.execute(
             "UPDATE videos SET funscript_count=?, funscript_axes=?, updated_at=? WHERE id=?",
             (int(count), axes_json, _now(), video_id),
+        )
+        self.conn.commit()
+
+    def set_music_state(self, video_id: int, state: int) -> None:
+        self.conn.execute("UPDATE videos SET music_state = ? WHERE id = ?", (int(state), int(video_id)))
+        self.conn.commit()
+
+    def set_dance_state(self, video_id: int, state: int) -> None:
+        self.conn.execute("UPDATE videos SET dance_state = ? WHERE id = ?", (int(state), int(video_id)))
+        self.conn.commit()
+
+    def set_music_groups(self, assignments: list[tuple[int, int]]) -> None:
+        """assignments: [(video_id, music_group)]，只改音乐组。"""
+        self.conn.executemany(
+            "UPDATE videos SET music_group = ?, updated_at = ? WHERE id = ?",
+            [(int(m), _now(), int(vid)) for vid, m in assignments],
+        )
+        self.conn.commit()
+
+    def set_dance_groups(self, assignments: list[tuple[int, int, float, int]]) -> None:
+        """assignments: [(video_id, dance_group, confidence, grouped)]。"""
+        self.conn.executemany(
+            "UPDATE videos SET dance_group = ?, confidence = ?, dance_grouped = ?, updated_at = ? WHERE id = ?",
+            [(d, c, int(g), _now(), int(vid)) for vid, d, c, g in assignments],
         )
         self.conn.commit()
 
@@ -421,7 +465,7 @@ class Store:
         """标记为待处理并清空特征，用于「重新提取」。"""
         self.conn.execute(
             "UPDATE videos SET status='pending', error='', music_group=NULL, dance_group=NULL, "
-            "confidence=NULL, audio_npz=NULL, motion_npz=NULL, updated_at=? WHERE id=?",
+            "dance_grouped=0, confidence=NULL, audio_npz=NULL, motion_npz=NULL, updated_at=? WHERE id=?",
             (_now(), video_id),
         )
         self.conn.execute("DELETE FROM pair_cache WHERE a_id=? OR b_id=?", (video_id, video_id))
