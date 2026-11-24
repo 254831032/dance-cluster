@@ -18,6 +18,12 @@ import numpy as np
 DEFAULT_SR = 22050
 EPS = 1e-9
 
+# 指纹（chromaprint）判「同一首歌」的相似度阈值。
+# 1 - BER：同曲（干净/对齐）BER≈0.05~0.15 → sim 0.85~0.95；
+# 不同歌但同类（EDM/舞曲）BER 常落在 0.30~0.40 → sim 0.60~0.70。
+# 原 0.65 会把这些「同类不同歌」误并，这里上调到 0.80（BER≤0.20）。
+FINGERPRINT_THRESHOLD = 0.80
+
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
@@ -222,7 +228,7 @@ def music_similarity(fa: dict, fb: dict) -> float:
     fpb = fb.get("fingerprint")
     if fpa is not None and fpb is not None:
         s = fingerprint_similarity(fpa, fpb)
-        if s >= 0.65:
+        if s >= FINGERPRINT_THRESHOLD:
             return s
 
     cs = similarity(

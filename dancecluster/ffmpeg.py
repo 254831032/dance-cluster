@@ -16,6 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Windows 下避免每个 ffmpeg/ffprobe 调用都弹出命令行窗口
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
+# 限制视频编码线程数，避免并行识别时多个 ffmpeg 各自用满所有核把 CPU 拉满。
+# 可用环境变量 DANCECLUSTER_FFMPEG_THREADS 覆盖（如 "1"）。
+_MAX_THREADS = os.environ.get("DANCECLUSTER_FFMPEG_THREADS", "2")
+
 
 def _tool(name: str) -> str:
     env = os.environ.get(f"DANCECLUSTER_{name.upper()}")
@@ -107,6 +111,7 @@ def cut_clip(
             cmd += ["-vf", f"scale=-2:{max_height}"]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-threads", _MAX_THREADS,
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out),
         ]
     else:
@@ -233,6 +238,7 @@ def extract_mp4_thumb(
         ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{at:.2f}", "-t", f"{duration:.2f}", "-i", str(video),
         "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+        "-threads", _MAX_THREADS,
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
     ]
     _run(cmd)
