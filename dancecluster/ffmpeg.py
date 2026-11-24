@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import subprocess
-import threading
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,15 +19,6 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 # 限制视频编码线程数，避免并行识别时多个 ffmpeg 各自用满所有核把 CPU 拉满。
 # 可用环境变量 DANCECLUSTER_FFMPEG_THREADS 覆盖（如 "1"）。
 _MAX_THREADS = os.environ.get("DANCECLUSTER_FFMPEG_THREADS", "2")
-
-# 全局 ffmpeg/ffprobe 并发上限：多 worker 并行时，同时只允许这么多 ffmpeg 进程在跑，
-# 从源头避免 CPU/GPU 打满，以及 NVENC 会话数超限导致的「打开编码器失败」。
-# 可用环境变量 DANCECLUSTER_FFMPEG_CONCURRENCY 覆盖（默认 3）。
-try:
-    _FFMPEG_CONCURRENCY = max(1, int(os.environ.get("DANCECLUSTER_FFMPEG_CONCURRENCY", "3")))
-except ValueError:
-    _FFMPEG_CONCURRENCY = 3
-_FFMPEG_SLOTS = threading.Semaphore(_FFMPEG_CONCURRENCY)
 
 _nvenc_cache: bool | None = None
 
@@ -56,6 +46,34 @@ def _nvenc_available() -> bool:
     return _nvenc_cache
 
 
+_nvenc_warmup_done = False
+
+
+def nvenc_warmup() -> None:
+    """一次性预热 NVENC：在并行 worker 启动前跑一次极小编码，触发驱动级 CUDA 初始化。
+
+    多个 ffmpeg 进程同时冷启动 CUDA 可能偶发「打开编码器失败」，先串行预热一次
+    可显著降低这种瞬时竞争。失败忽略，不影响后续（仍有 libx264 回退兜底）。
+    """
+    global _nvenc_warmup_done
+    if _nvenc_warmup_done:
+        return
+    _nvenc_warmup_done = True
+    if not _nvenc_available():
+        return
+    try:
+        subprocess.run(
+            [
+                ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:size=128x128:rate=5:duration=0.2",
+                "-c:v", "h264_nvenc", "-preset", "p4", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+
 def _tool(name: str) -> str:
     env = os.environ.get(f"DANCECLUSTER_{name.upper()}")
     if env and Path(env).exists():
@@ -81,8 +99,7 @@ def ffprobe() -> str:
 
 
 def _run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
-    with _FFMPEG_SLOTS:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-8:])
         raise RuntimeError(f"命令失败({proc.returncode}): {' '.join(cmd)}\n{tail}")

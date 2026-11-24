@@ -506,6 +506,9 @@ def process_pending(cfg: AppConfig, progress=None, only_ids: list | None = None,
                 _close_async(lm)
             s.close()
 
+    # 并行前一次性预热 NVENC，串行触发驱动级 CUDA 初始化，避免多进程同时冷启动竞争
+    ffmpeg.nvenc_warmup()
+
     workers = _worker_count(total)
     if workers <= 1:
         _run_chunk(pending)
