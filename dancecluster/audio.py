@@ -181,8 +181,12 @@ def fingerprint(path: str) -> np.ndarray | None:
     return np.unpackbits(ints.view(np.uint8)).reshape(-1, 32).astype(np.uint8)
 
 
-def fingerprint_similarity(fa: np.ndarray, fb: np.ndarray, max_offset: int = 20) -> float:
-    """1 - 最小比特错误率（BER）。fa/fb: (T,32)。向量化滑动窗口。"""
+def fingerprint_similarity(fa: np.ndarray, fb: np.ndarray, max_offset: int = 0) -> float:
+    """1 - 最小比特错误率（BER）。fa/fb: (T,32)。
+
+    只做「从开头对齐」的比较（max_offset=0）：同一首歌必须从视频一开始就相同，
+    不搜索中间片段。两段长度不同时按较短者从开头对齐。
+    """
     na, nb = len(fa), len(fb)
     if na < 2 or nb < 2:
         return 0.0
@@ -215,9 +219,9 @@ def _tempo_conflict(ta: float, tb: float, tol: float = 0.08) -> bool:
 
 
 def music_similarity(fa: dict, fb: dict) -> float:
-    """音频是否同一首的综合判定（0~1），强判别：
+    """音频是否同一首的综合判定（0~1）。从视频开头对齐，不搜索中间片段：
     1) tempo 差太大 → 0（不同/变速版）
-    2) 指纹 BER <= 0.35 → 同一首（返回指纹相似度）
+    2) 指纹 BER <= 0.20 → 同一首（返回指纹相似度，从开头对齐）
     3) chroma 变调不变相似度 >= 0.92 → 同一首（兜底，覆盖变调）
     否则 0。"""
 
