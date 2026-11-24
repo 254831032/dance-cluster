@@ -140,10 +140,12 @@ def index_video(
             fp = audio.fingerprint(str(wav))
             # 音频特征已入库，wav 只留给预览 → 压成 AAC 省空间
             m4a = cdir / "audio.m4a"
-            if not m4a.exists():
+            # 0 字节的 m4a 说明上次 to_aac 失败/被中断，也按缺失处理，下次重试
+            if not m4a.exists() or m4a.stat().st_size == 0:
                 try:
                     ffmpeg.to_aac(wav, m4a, bitrate="96k")
-                    wav.unlink(missing_ok=True)
+                    if m4a.stat().st_size > 0:
+                        wav.unlink(missing_ok=True)
                 except Exception:
                     pass
             store.set_audio(

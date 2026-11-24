@@ -46,13 +46,6 @@ def _nvenc_available() -> bool:
     return _nvenc_cache
 
 
-def _h264_args(quality: int) -> list[str]:
-    """视频编码参数：NVENC 硬编（省 CPU、快），否则 libx264 软编兜底。"""
-    if _nvenc_available():
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(quality), "-b:v", "0"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(quality), "-threads", _MAX_THREADS]
-
-
 def _tool(name: str) -> str:
     env = os.environ.get(f"DANCECLUSTER_{name.upper()}")
     if env and Path(env).exists():
@@ -77,7 +70,7 @@ def ffprobe() -> str:
     return _tool("ffprobe")
 
 
-def _run(cmd: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-8:])
@@ -92,7 +85,8 @@ def probe(video: str | Path) -> dict:
             ffprobe(), "-v", "error", "-show_entries",
             "format=duration:stream=codec_type,width,height,r_frame_rate,codec_name",
             "-of", "json", str(video),
-        ]
+        ],
+        timeout=60,
     )
     info = json.loads(proc.stdout or "{}")
     streams = info.get("streams", [])
@@ -135,24 +129,29 @@ def cut_clip(
         need_scale = info["height"] > max_height
 
     if reencode or need_scale:
-        cmd = [
+        base = [
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
-            "-threads", _MAX_THREADS,   # 限制解码线程
+            "-threads", _MAX_THREADS,
             "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
         ]
         if need_scale:
-            cmd += ["-vf", f"scale=-2:{max_height}"]
-        cmd += _h264_args(23) + [
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out),
-        ]
+            base += ["-vf", f"scale=-2:{max_height}"]
+        tail = ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)]
+        # NVENC 优先；失败（会话数超限/分辨率不支持等）自动回退软编
+        if _nvenc_available():
+            try:
+                _run(base + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-b:v", "0"] + tail)
+                return out
+            except RuntimeError:
+                pass
+        _run(base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", _MAX_THREADS] + tail)
     else:
-        cmd = [
+        _run([
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
             "-c", "copy", "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart", str(out),
-        ]
-    _run(cmd)
+        ])
     return out
 
 
