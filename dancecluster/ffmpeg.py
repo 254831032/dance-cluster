@@ -20,6 +20,38 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 # 可用环境变量 DANCECLUSTER_FFMPEG_THREADS 覆盖（如 "1"）。
 _MAX_THREADS = os.environ.get("DANCECLUSTER_FFMPEG_THREADS", "2")
 
+_nvenc_cache: bool | None = None
+
+
+def _nvenc_available() -> bool:
+    """检测当前 ffmpeg 是否支持 NVIDIA NVENC 硬件编码（结果缓存）。
+
+    有 nvidia-smi（NVIDIA 驱动）+ ffmpeg 带 h264_nvenc 编码器才返回 True，
+    否则回退 CPU 软编。任何异常都按「不可用」处理，保证不崩。
+    """
+    global _nvenc_cache
+    if _nvenc_cache is not None:
+        return _nvenc_cache
+    if shutil.which("nvidia-smi") is None:
+        _nvenc_cache = False
+        return False
+    try:
+        proc = subprocess.run(
+            [ffmpeg(), "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW,
+        )
+        _nvenc_cache = "h264_nvenc" in (proc.stdout or "")
+    except Exception:
+        _nvenc_cache = False
+    return _nvenc_cache
+
+
+def _h264_args(quality: int) -> list[str]:
+    """视频编码参数：NVENC 硬编（省 CPU、快），否则 libx264 软编兜底。"""
+    if _nvenc_available():
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(quality), "-b:v", "0"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(quality), "-threads", _MAX_THREADS]
+
 
 def _tool(name: str) -> str:
     env = os.environ.get(f"DANCECLUSTER_{name.upper()}")
@@ -110,9 +142,7 @@ def cut_clip(
         ]
         if need_scale:
             cmd += ["-vf", f"scale=-2:{max_height}"]
-        cmd += [
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-threads", _MAX_THREADS,   # 限制编码线程
+        cmd += _h264_args(23) + [
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out),
         ]
     else:

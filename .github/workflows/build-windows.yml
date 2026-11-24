@@ -32,6 +32,8 @@ jobs:
           Copy-Item $ff.FullName .tools/bin/ffmpeg.exe
           Copy-Item $fp.FullName .tools/bin/ffprobe.exe
           .tools/bin/ffmpeg.exe -version
+          Write-Output "--- nvenc encoders ---"
+          .tools/bin/ffmpeg.exe -hide_banner -encoders | Select-String "nvenc"
 
       - name: Download fpcalc (chromaprint)
         shell: pwsh
