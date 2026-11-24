@@ -418,7 +418,13 @@ def register_videos(paths: list, cfg: AppConfig, progress=None) -> dict:
 
 
 def _worker_count(n: int) -> int:
-    """并行度：CPU 一半，最多 4，且不超过待处理数。"""
+    """并行度：默认 CPU 一半、最多 4；可用环境变量 DANCECLUSTER_WORKERS 覆盖。"""
+    env = os.environ.get("DANCECLUSTER_WORKERS")
+    if env:
+        try:
+            return max(1, min(int(env), max(1, n)))
+        except ValueError:
+            pass
     try:
         cpu = os.cpu_count() or 4
     except Exception:

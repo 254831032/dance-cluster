@@ -105,13 +105,14 @@ def cut_clip(
     if reencode or need_scale:
         cmd = [
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+            "-threads", _MAX_THREADS,   # 限制解码线程
             "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
         ]
         if need_scale:
             cmd += ["-vf", f"scale=-2:{max_height}"]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-threads", _MAX_THREADS,
+            "-threads", _MAX_THREADS,   # 限制编码线程
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out),
         ]
     else:
@@ -236,9 +237,10 @@ def extract_mp4_thumb(
     vf = f"fps={int(fps)},scale={int(width)}:-2:flags=lanczos"
     cmd = [
         ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", _MAX_THREADS,   # 限制解码线程
         "-ss", f"{at:.2f}", "-t", f"{duration:.2f}", "-i", str(video),
         "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
-        "-threads", _MAX_THREADS,
+        "-threads", _MAX_THREADS,   # 限制编码线程
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
     ]
     _run(cmd)
