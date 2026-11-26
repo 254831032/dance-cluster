@@ -105,6 +105,23 @@ CREATE TABLE IF NOT EXISTS video_scripts (
     created_at      TEXT,
     PRIMARY KEY (video_id, source_video_id)
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL,
+    state       TEXT    NOT NULL DEFAULT 'pending',
+    progress    INTEGER NOT NULL DEFAULT 0,
+    total       INTEGER NOT NULL DEFAULT 0,
+    stage       TEXT    NOT NULL DEFAULT '',
+    name        TEXT    NOT NULL DEFAULT '',
+    log         TEXT    NOT NULL DEFAULT '[]',
+    detail      TEXT    NOT NULL DEFAULT '{}',
+    error       TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT,
+    started_at  TEXT,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 """
 
 
@@ -170,6 +187,39 @@ class Store:
         except sqlite3.OperationalError:
             pass
         self.conn.commit()
+
+    # ---------- 任务 ----------
+    def create_task(self, kind: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO tasks (kind, created_at) VALUES (?, ?)",
+            (kind, _now()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_task(self, task_id: int, **fields) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        vals = list(fields.values())
+        self.conn.execute(f"UPDATE tasks SET {cols} WHERE id = ?", (*vals, int(task_id)))
+        self.conn.commit()
+
+    def get_task(self, task_id: int) -> dict | None:
+        row = self.conn.execute("SELECT * FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
+        return dict(row) if row else None
+
+    def list_tasks(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def task_by_state(self, state: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM tasks WHERE state = ? ORDER BY id", (state,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self) -> None:
         self.conn.commit()
@@ -322,6 +372,23 @@ class Store:
             (min(a, b), max(a, b), kind),
         ).fetchone()
         return float(row["value"]) if row else None
+
+    def get_pairs_all(self, kind: str) -> dict:
+        """一次把某类 pair_cache 全读进内存，避免两两循环里的 N 次单查。"""
+        rows = self.conn.execute(
+            "SELECT a_id, b_id, value FROM pair_cache WHERE kind = ?", (kind,)
+        ).fetchall()
+        return {(int(r["a_id"]), int(r["b_id"])): float(r["value"]) for r in rows}
+
+    def set_pairs_batch(self, kind: str, pairs: list[tuple[int, int, float]]) -> None:
+        """批量写 pair_cache（executemany + 单次 commit）。"""
+        if not pairs:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO pair_cache (a_id, b_id, kind, value) VALUES (?, ?, ?, ?)",
+            [(min(int(a), int(b)), max(int(a), int(b)), kind, float(v)) for a, b, v in pairs],
+        )
+        self.conn.commit()
 
     def set_pair(self, a: int, b: int, kind: str, value: float) -> None:
         # 不逐条 commit，由外层 close()/其它 commit 统一落盘

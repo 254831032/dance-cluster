@@ -21,16 +21,21 @@ from pathlib import Path
 EXT = ".funscript"
 
 # 键名 → 标准轴 映射表（尽量全，兼容多种工具/格式）
+# 键名/自然轴名 -> 标准轴（对照六轴映射：L0=上下 L1=左右 L2=前后 R0=扭转 R1=俯仰 R2=侧倾）
 AXIS_ALIASES = {
-    "actions": "L0",
-    "l0": "L0", "stroke": "L0", "surge": "L0",
+    # 主轴 / 上下（stroke、heave、main）
+    "actions": "L0", "l0": "L0", "stroke": "L0", "main": "L0", "heave": "L0",
+    # 左右（sway）
     "l1": "L1", "sway": "L1",
-    "l2": "L2",
-    "r0": "R0", "twist": "R0",
+    # 前后（surge）
+    "l2": "L2", "surge": "L2",
+    # 扭转（twist / yaw）
+    "r0": "R0", "twist": "R0", "yaw": "R0",
+    # 俯仰（pitch）
     "r1": "R1", "pitch": "R1",
+    # 侧倾（roll）
     "r2": "R2", "roll": "R2",
-    "v0": "V0",
-    "v1": "V1",
+    "v0": "V0", "v1": "V1",
 }
 
 
@@ -80,11 +85,9 @@ def _axis_name(key: str) -> str:
     if k in AXIS_ALIASES:
         return AXIS_ALIASES[k]
     if k.startswith("actions_"):
-        suffix = k[len("actions_"):]
-        if suffix in AXIS_ALIASES:
-            return AXIS_ALIASES[suffix]
-        return suffix.upper()
-    return key
+        suffix = k[len("actions_"):].lower().strip()
+        return AXIS_ALIASES.get(suffix, suffix)
+    return k
 
 
 def _norm_action(a) -> list[int] | None:
@@ -107,7 +110,7 @@ def detect_axes(data) -> list[str]:
         # 情况 F：顶层就是动作数组，每个动作带 axis
         for a in data:
             if isinstance(a, dict) and a.get("axis"):
-                ax = str(a["axis"]).upper()
+                ax = _axis_name(str(a["axis"]))
                 if ax and ax not in axes:
                     axes.append(ax)
         return axes
@@ -230,9 +233,12 @@ def scan(video_path: str | Path) -> dict:
     detail = []
     for axis_from_name, p in files:
         info = parse(p)
-        inner = info["axes"] or (
-            [axis_from_name] if axis_from_name and axis_from_name != "main" else ["L0"]
-        )
+        if axis_from_name and axis_from_name != "main":
+            # 带轴后缀的文件：轴名以文件名后缀为准（内容 actions 一律是 L0）
+            inner = [_axis_name(axis_from_name)]
+        else:
+            # 主文件：可能是单文件多轴（按内容），否则主轴 L0
+            inner = info["axes"] or ["L0"]
         for ax in inner:
             if ax not in all_axes:
                 all_axes.append(ax)
@@ -254,3 +260,87 @@ def level(count: int) -> str:
     if count == 1:
         return "single"
     return "multi"
+
+
+def validate(path: str | Path) -> dict:
+    """校验一个 funscript 是否正确。
+
+    返回 {ok, errors, warnings, axes, count}：
+      errors   —— 致命错误（无法解析 / 无轨道 / 越界 / 负时间戳）
+      warnings —— 可容忍问题（时间戳非递增、空轨道）
+    """
+    p = Path(path)
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "errors": [f"读取失败：{e}"], "warnings": [], "axes": [], "count": 0}
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as e:
+        return {"ok": False, "errors": [f"JSON 解析失败：{e}"], "warnings": [], "axes": [], "count": 0}
+
+    tracks = parse_tracks(p)
+    if not tracks:
+        return {"ok": False, "errors": ["没有检测到任何动作轨道"], "warnings": [], "axes": [], "count": 0}
+
+    total = 0
+    for ax, acts in tracks.items():
+        if not acts:
+            warnings.append(f"轴 {ax} 动作列表为空")
+            continue
+        total += len(acts)
+        prev_at: int | None = None
+        for at, pos in acts:
+            if at < 0:
+                errors.append(f"轴 {ax} 含负时间戳 {at}ms")
+            if pos < 0 or pos > 100:
+                errors.append(f"轴 {ax} 含越界位置 {pos}（应在 0~100）")
+            if prev_at is not None and at < prev_at:
+                warnings.append(f"轴 {ax} 时间戳非递增（{prev_at} -> {at}ms）")
+            prev_at = at
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "axes": list(tracks.keys()),
+        "count": total,
+    }
+
+
+def merge(video_path: str | Path, out_path: str | Path) -> dict:
+    """把视频的多轴脚本合并成单个多轴 funscript（脚本输出）。
+
+    输出格式：{"actions": [...], "actions_pitch": [...], "actions_roll": [...], ...}
+    主文件（xxx.funscript）作为 actions，带轴后缀的文件作为 actions_<轴名>。
+    """
+    files = find_for(video_path)
+    if not files:
+        return {"ok": False, "error": "没有找到关联脚本"}
+    merged: dict = {}
+    axes: list[str] = []
+    errors: list[str] = []
+    for axis_from_name, fp in files:
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception as e:
+            errors.append(f"{axis_from_name}: {e}")
+            continue
+        actions = data.get("actions", [])
+        if axis_from_name == "main":
+            merged["actions"] = actions
+            axes.append("L0")
+        else:
+            merged[f"actions_{axis_from_name}"] = actions
+            axes.append(_axis_name(axis_from_name))
+    if not merged:
+        return {"ok": False, "error": "没有可合并的轨道", "errors": errors}
+    out = Path(out_path)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "error": f"写入失败：{e}", "path": str(out), "axes": axes}
+    return {"ok": True, "path": str(out), "axes": axes, "count": len(axes), "errors": errors}

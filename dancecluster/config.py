@@ -88,10 +88,10 @@ def save_settings(data: dict) -> Path:
 
 @dataclass
 class ClipConfig:
-    """视频切片参数。默认取开头 20 秒，可被单文件覆盖。"""
+    """视频切片参数。默认取开头 15 秒，可被单文件覆盖。"""
 
     start: float = 0.0
-    duration: float = 20.0
+    duration: float = 15.0
     # 音频片段长度（秒）。音频比骨架便宜，可取更长；0 = 整段
     audio_duration: float = 60.0
     # 截取片段的最大高度（像素）。超过就重编码缩到该高度，省空间（4K→720p）

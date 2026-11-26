@@ -102,7 +102,7 @@ def main() -> int:
                 pass
             return False
         # 无托盘的平台：任务进行中才提示，避免误关
-        if webui._state.get("running"):
+        if webui._is_running():
             try:
                 return bool(
                     window.create_confirmation_dialog(

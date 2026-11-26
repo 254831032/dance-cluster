@@ -15,9 +15,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import socket
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from pathlib import Path
@@ -26,23 +28,13 @@ from flask import Flask, Response, jsonify, request, send_file
 
 from . import config, ffmpeg, flow, funscript, pipeline, pose, scripts
 from .config import AppConfig
-from .db import Store
+from .db import Store, _now
 
 app = Flask(__name__)
 
 _lock = threading.Lock()
 _ui = {"desktop": False, "window": None}
 _app_state: dict = {"cache_dir": ""}
-_state: dict = {
-    "running": False,
-    "progress": 0,
-    "total": 0,
-    "stage": "",
-    "name": "",
-    "log": [],
-    "error": "",
-    "cancel": False,
-}
 
 
 class _Cancelled(Exception):
@@ -186,9 +178,12 @@ def _generate_thumb(video_id: int, kind: str, row: dict, out: Path) -> None:
     elif kind == "thumb_mp4":
         cfg = _cfg()
         clip = cdir / "clip.mp4"
-        src = str(clip) if clip.exists() else row["path"]
+        # 先确保 720p 代理存在（4K 只解这一次），缩略图和骨架预览共用，避免各自解 4K
+        if not clip.exists():
+            ffmpeg.cut_clip(row["path"], clip, cfg.clip.start, cfg.clip.duration,
+                            cfg.clip.reencode, max_height=cfg.clip.max_height)
         dur = max(2.0, min(float(row["duration"] or 20.0), float(cfg.clip.duration or 20.0)))
-        ffmpeg.extract_mp4_thumb(src, out, at=0.0, duration=dur, fps=6, width=220)
+        ffmpeg.extract_mp4_thumb(str(clip), out, at=0.0, duration=dur, fps=6, width=220)
     elif kind == "skel":
         pose_npz = cdir / "pose.npz"
         if pose_npz.exists():
@@ -239,152 +234,246 @@ def _generate_thumb_sync(video_id: int, kind: str) -> Path | None:
 
 
 def pre_generate_thumbs(ids) -> None:
-    """提取完成后后台预热缩略图 / GIF / 骨架视频（不阻塞，复用同一套同步生成）。"""
+    """提取完成后后台预热「静态缩略图」（便宜）。动画缩略图按需生成，
+    避免后台为了动画图白白解码 4K（生成 720p clip）。"""
     def _worker():
         for vid in ids:
-            for kind in ("thumb", "thumb_mp4"):
-                try:
-                    _generate_thumb_sync(vid, kind)
-                except Exception:
-                    pass
+            try:
+                _generate_thumb_sync(vid, "thumb")
+            except Exception:
+                pass
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _snapshot() -> dict:
-    with _lock:
-        return {
-            "running": _state["running"],
-            "progress": _state["progress"],
-            "total": _state["total"],
-            "stage": _state["stage"],
-            "name": _state["name"],
-            "log": list(_state["log"]),
-            "error": _state["error"],
-        }
+def _task_summary(t: dict) -> dict:
+    return {
+        "id": t["id"], "kind": t["kind"], "state": t["state"],
+        "progress": t["progress"], "total": t["total"], "stage": t["stage"],
+        "name": t["name"],
+        "detail": json.loads(t["detail"] or "{}"),
+        "error": t["error"],
+        "created_at": t["created_at"], "started_at": t["started_at"],
+        "finished_at": t["finished_at"],
+    }
 
 
-def _log(msg: str) -> None:
-    with _lock:
-        _state["log"].append(msg)
-
-
-# ---------- 任务 ----------
-def _start_job(params: dict) -> str | None:
-    """启动后台任务（扫描/提取/分组）。已有任务在跑时返回错误信息，成功返回 None。"""
-    with _lock:
-        if _state["running"]:
-            return "有任务正在运行，请稍候或先取消"
-        _state.update(running=True, progress=0, total=0, stage="准备中", name="",
-                      log=[], error="", cancel=False)
-    threading.Thread(target=_run_job, args=(params,), daemon=True).start()
-    return None
-
-
-def _run_job(params: dict) -> None:
-    def progress(i: int, total: int, name: str, stage: str) -> None:
-        if _state["cancel"]:
-            raise _Cancelled()
-        with _lock:
-            _state.update(progress=i, total=total, name=name, stage=stage)
-
-    def _counts(store):
-        rows = store.all_videos()
-        return {
-            "total": len(rows),
-            "done": sum(1 for r in rows if r["status"] in ("ok", "no_pose")),
-            "pending": sum(1 for r in rows if r["status"] in ("pending", "extracting")),
-            "error": sum(1 for r in rows if r["status"] == "error"),
-        }
-
+def _is_running() -> bool:
     try:
-        cfg = _cfg()
-        cfg.clip.start = float(params.get("start", 0.0))
-        cfg.clip.duration = float(params.get("duration", 20.0))
-        cfg.match.music_threshold = float(params.get("music", 0.55))
-        cfg.match.dance_threshold = float(params.get("dance", 0.35))
-        cfg.match.mirror_invariant = bool(params.get("mirror", True))
-
         store = _store()
-        store.reset_stale_extracting()
-        store.close()
-
-        # 可选阶段 0：扫描新文件夹/视频（登记为待识别），大目录走后台 + 进度条
-        scan = params.get("scan")
-        if scan:
-            folder = scan.get("folder")
-            paths = scan.get("paths")
-            with _lock:
-                _state["stage"] = "scanning"
-            if folder:
-                _log(f"扫描文件夹：{folder}")
-                pipeline.register_folder(folder, cfg, progress=progress)
-            elif paths:
-                _log("扫描视频文件…")
-                pipeline.register_videos(paths, cfg, progress=progress)
-
-        before = _counts(_store())
-        _log(f"开始提取（待处理 {before['pending']} 个，已完成 {before['done']} 个将跳过）…")
-        records = pipeline.process_pending(cfg, progress=progress, only_ids=params.get("ids"), with_pose=False)
-        if _state["cancel"]:
-            raise _Cancelled()
-        _log("提取完成，正在分组…")
-        pipeline.group(records, cfg)
-        pre_generate_thumbs([r.id for r in records])
-        after = _counts(_store())
-        _log(
-            f"完成：共 {after['total']} 个视频，"
-            f"已完成 {after['done']} 个（本次新增 {max(after['done'] - before['done'], 0)} 个，"
-            f"跳过 {before['done']} 个已完成），失败 {after['error']} 个，待处理 {after['pending']} 个"
-        )
-        with _lock:
-            _state["stage"] = "完成"
-    except _Cancelled:
-        _log("已取消")
-        with _lock:
-            _state["stage"] = "已取消"
-    except Exception:
-        tb = traceback.format_exc()
-        _log(tb)
-        with _lock:
-            _state["stage"] = "出错"
-            _state["error"] = tb
-    finally:
-        with _lock:
-            _state["running"] = False
-
-
-def _start_dance_job(ids: list[int]) -> str | None:
-    """动作分组后台任务。"""
-    with _lock:
-        if _state["running"]:
-            return "有任务正在运行，请稍候或先取消"
-        _state.update(running=True, progress=0, total=len(ids), stage="动作分组",
-                      name="", log=[], error="", cancel=False)
-
-    def _run():
-        def progress(i, total, name, stage):
-            with _lock:
-                _state.update(progress=i, total=total, name=name, stage=stage)
         try:
-            res = pipeline.submit_dance_group(ids, _cfg(), progress=progress)
-            if not res.get("ok"):
-                _log(f"动作分组失败：{res.get('error')}")
-            else:
-                _log(f"动作分组完成：{res.get('grouped')}/{res.get('total')} 个有骨架")
-            with _lock:
-                _state["stage"] = "完成"
+            return bool(store.task_by_state("running"))
+        finally:
+            store.close()
+    except Exception:
+        return False
+
+
+def _snapshot() -> dict:
+    """从 DB 读当前运行任务 + 最近任务列表（任务持久化，不再驻留内存）。"""
+    try:
+        store = _store()
+    except RuntimeError:
+        return {"running": False, "progress": 0, "total": 0, "stage": "",
+                "name": "", "log": [], "error": "", "tasks": []}
+    try:
+        running = store.task_by_state("running")
+        tasks = store.list_tasks(limit=50)
+    finally:
+        store.close()
+    cur = running[0] if running else None
+    last = tasks[0] if tasks else None
+    src = cur or last
+    return {
+        "running": bool(cur),
+        "kind": (src or {}).get("kind", ""),
+        "progress": (src or {}).get("progress", 0),
+        "total": (src or {}).get("total", 0),
+        "stage": (src or {}).get("stage", ""),
+        "name": (src or {}).get("name", ""),
+        "log": json.loads((cur or {}).get("log") or "[]") if cur else [],
+        "error": (src or {}).get("error", ""),
+        "tasks": [_task_summary(t) for t in tasks],
+    }
+
+
+# ---------- 任务队列（持久化 + 单 worker 串行） ----------
+_task_queue: queue.Queue = queue.Queue()
+_task_thread: threading.Thread | None = None
+_task_cancel: dict = {"flag": False}
+
+_KIND_LABEL = {"music": "音乐分组", "dance": "动作分组"}
+
+
+def _ensure_task_worker() -> None:
+    global _task_thread
+    if _task_thread is None or not _task_thread.is_alive():
+        _task_thread = threading.Thread(target=_task_worker, daemon=True)
+        _task_thread.start()
+
+
+def _task_worker() -> None:
+    while True:
+        item = _task_queue.get()
+        if item is None:
+            break
+        task_id, kind, payload = item
+        try:
+            _run_task(task_id, kind, payload)
         except Exception:
             tb = traceback.format_exc()
-            _log(tb)
-            with _lock:
-                _state["stage"] = "出错"
-                _state["error"] = tb
+            store = _store()
+            try:
+                store.update_task(task_id, state="failed", stage="出错",
+                                  error=tb, finished_at=_now())
+            finally:
+                store.close()
         finally:
-            with _lock:
-                _state["running"] = False
+            _task_queue.task_done()
 
-    threading.Thread(target=_run, daemon=True).start()
-    return None
+
+def submit_task(kind: str, payload: dict) -> tuple[int, str | None]:
+    """提交任务：落库 pending + 入队。返回 (task_id, error)。"""
+    store = _store()
+    try:
+        if store.task_by_state("running"):
+            return 0, "有任务正在运行，请稍候或先取消"
+        tid = store.create_task(kind)
+    finally:
+        store.close()
+    _task_queue.put((tid, kind, payload))
+    _ensure_task_worker()
+    return tid, None
+
+
+def _run_task(task_id: int, kind: str, payload: dict) -> None:
+    logs: list[str] = []
+
+    def _log_task(msg: str) -> None:
+        logs.append(msg)
+
+    def progress(i: int, total: int, name: str, stage: str) -> None:
+        if _task_cancel["flag"]:
+            raise _Cancelled()
+        store = _store()
+        try:
+            store.update_task(task_id, progress=int(i), total=int(total), name=name, stage=stage)
+        finally:
+            store.close()
+
+    _task_cancel["flag"] = False
+    store = _store()
+    try:
+        store.update_task(task_id, state="running", started_at=_now(), stage="准备中")
+    finally:
+        store.close()
+
+    def _finish(state: str, stage: str, error: str = "") -> None:
+        store = _store()
+        try:
+            store.update_task(task_id, state=state, stage=stage, error=error,
+                              finished_at=_now(), log=json.dumps(logs, ensure_ascii=False))
+        finally:
+            store.close()
+
+    try:
+        if kind == "music":
+            _run_music_task(task_id, payload, progress, _log_task)
+        elif kind == "dance":
+            _run_dance_task(task_id, payload, progress, _log_task)
+        else:
+            raise RuntimeError(f"未知任务类型：{kind}")
+        _finish("done", "完成")
+    except _Cancelled:
+        _finish("canceled", "已取消")
+    except Exception:
+        tb = traceback.format_exc()
+        _log_task(tb)
+        _finish("failed", "出错", error=tb)
+
+
+def _counts(store) -> dict:
+    rows = store.all_videos()
+    return {
+        "total": len(rows),
+        "done": sum(1 for r in rows if r["status"] in ("ok", "no_pose")),
+        "pending": sum(1 for r in rows if r["status"] in ("pending", "extracting")),
+        "error": sum(1 for r in rows if r["status"] == "error"),
+    }
+
+
+def _run_music_task(task_id: int, payload: dict, progress, log) -> None:
+    cfg = _cfg()
+    cfg.clip.start = float(payload.get("start", 0.0))
+    cfg.clip.duration = float(payload.get("duration", 15.0))
+    cfg.match.music_threshold = float(payload.get("music", 0.55))
+    cfg.match.dance_threshold = float(payload.get("dance", 0.35))
+    cfg.match.mirror_invariant = bool(payload.get("mirror", True))
+
+    store = _store()
+    store.reset_stale_extracting()
+    store.close()
+
+    scan = payload.get("scan")
+    if scan:
+        folder = scan.get("folder")
+        paths = scan.get("paths")
+        if folder:
+            log(f"扫描文件夹：{folder}")
+            pipeline.register_folder(folder, cfg, progress=progress)
+        elif paths:
+            log("扫描视频文件…")
+            pipeline.register_videos(paths, cfg, progress=progress)
+
+    before = _counts(_store())
+    log(f"开始提取（待处理 {before['pending']} 个，已完成 {before['done']} 个将跳过）…")
+    records = pipeline.process_pending(cfg, progress=progress, only_ids=payload.get("ids"), with_pose=False)
+    log("提取完成，正在分组…")
+    pipeline.group(records, cfg)
+    pre_generate_thumbs([r.id for r in records])
+    after = _counts(_store())
+
+    # 详情：本任务范围内的每视频状态
+    store = _store()
+    try:
+        rows = store.all_videos()
+        scope = payload.get("ids")
+        if scope:
+            sset = set(int(x) for x in scope)
+            rows = [r for r in rows if r["id"] in sset]
+        detail = {
+            "summary": {
+                "total": len(rows),
+                "done": sum(1 for r in rows if r["status"] in ("ok", "no_pose")),
+                "pending": sum(1 for r in rows if r["status"] in ("pending", "extracting")),
+                "error": sum(1 for r in rows if r["status"] == "error"),
+            },
+            "videos": [{"id": r["id"], "name": r["name"], "status": r["status"]} for r in rows],
+        }
+        store.update_task(task_id, detail=json.dumps(detail, ensure_ascii=False))
+    finally:
+        store.close()
+
+    log(
+        f"完成：共 {after['total']} 个视频，"
+        f"已完成 {after['done']} 个（本次新增 {max(after['done'] - before['done'], 0)} 个，"
+        f"跳过 {before['done']} 个已完成），失败 {after['error']} 个，待处理 {after['pending']} 个"
+    )
+
+
+def _run_dance_task(task_id: int, payload: dict, progress, log) -> None:
+    ids = [int(x) for x in payload.get("ids", [])]
+    res = pipeline.submit_dance_group(ids, _cfg(), progress=progress)
+    if not res.get("ok"):
+        log(f"动作分组失败：{res.get('error')}")
+    else:
+        log(f"动作分组完成：{res.get('grouped')}/{res.get('total')} 个有骨架")
+    store = _store()
+    try:
+        store.update_task(task_id, detail=json.dumps({
+            "grouped": res.get("grouped", 0), "total": res.get("total", 0),
+        }, ensure_ascii=False))
+    finally:
+        store.close()
 
 
 @app.post("/api/dance/submit")
@@ -402,7 +491,7 @@ def dance_submit():
     if bad:
         return jsonify({"ok": False,
                         "error": f"{len(bad)} 个视频尚未完成主流程，不能提交动作分组"}), 400
-    err = _start_dance_job(ids)
+    _, err = submit_task("dance", {"ids": ids})
     if err:
         return jsonify({"ok": False, "error": err}), 409
     return jsonify({"ok": True})
@@ -565,7 +654,16 @@ def library_remove():
 def run():
     body = request.get_json(force=True, silent=True) or {}
     ids = [int(x) for x in body.get("ids", [])]
-    err = _start_job({"ids": ids} if ids else {})
+    if not ids:
+        # 无选择 = 只处理待提取（pending/error）；已完成的不重提
+        store = _store()
+        try:
+            has_pending = any(r["status"] in ("pending", "error") for r in store.all_videos())
+        finally:
+            store.close()
+        if not has_pending:
+            return jsonify({"ok": True, "message": "没有待处理的视频"})
+    _, err = submit_task("music", {"ids": ids} if ids else {})
     if err:
         return jsonify({"ok": False, "error": err}), 409
     return jsonify({"ok": True})
@@ -579,7 +677,7 @@ def import_videos():
     if not folder and not paths:
         return jsonify({"ok": False, "error": "请选择文件夹或视频"}), 400
     scan = {"folder": folder} if folder else {"paths": paths}
-    err = _start_job({"scan": scan})
+    _, err = submit_task("music", {"scan": scan})
     if err:
         return jsonify({"ok": False, "error": err}), 409
     return jsonify({"ok": True})
@@ -675,16 +773,33 @@ def funscript_detail(video_id):
     axes = []
     for axis, path in files:
         tracks = funscript.parse_tracks(path)
-        for ax, acts in tracks.items():
-            st = funscript._stats(acts)
-            axes.append({
-                "axis": ax,
-                "path": str(path),
-                "count": st["count"],
-                "duration_ms": st["duration_ms"],
-                "speed": st["speed"],
-                "actions": acts,
-            })
+        if axis and axis != "main":
+            # 带轴后缀的文件：轴名以文件名为准（内容 actions 一律是 L0）
+            acts = tracks.get("L0")
+            if acts is None and tracks:
+                acts = next(iter(tracks.values()))
+            if acts:
+                st = funscript._stats(acts)
+                axes.append({
+                    "axis": funscript._axis_name(axis),
+                    "path": str(path),
+                    "count": st["count"],
+                    "duration_ms": st["duration_ms"],
+                    "speed": st["speed"],
+                    "actions": acts,
+                })
+        else:
+            # 主文件：可能是单文件多轴，按内容
+            for ax, acts in tracks.items():
+                st = funscript._stats(acts)
+                axes.append({
+                    "axis": ax,
+                    "path": str(path),
+                    "count": st["count"],
+                    "duration_ms": st["duration_ms"],
+                    "speed": st["speed"],
+                    "actions": acts,
+                })
     return jsonify({"ok": True, "count": len(axes), "axes": axes})
 
 
@@ -813,6 +928,57 @@ def scripts_rescan():
         if made:
             stats["backed_up"] += 1
     return jsonify({"ok": True, **stats})
+
+
+@app.post("/api/scripts/validate")
+def scripts_validate():
+    """校验视频关联脚本是否正确（JSON/越界/时间戳）。"""
+    body = request.get_json(force=True, silent=True) or {}
+    vid = int(body.get("video_id", 0) or 0)
+    if not vid:
+        return jsonify({"ok": False, "error": "参数缺失"}), 400
+    row = _get_row(vid)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    files = funscript.find_for(row["path"])
+    if not files:
+        return jsonify({"ok": True, "all_ok": False, "files": [], "message": "没有关联脚本"})
+    results = []
+    all_ok = True
+    for axis, fp in files:
+        v = funscript.validate(fp)
+        if not v["ok"]:
+            all_ok = False
+        axes_out = v["axes"]
+        if axis and axis != "main":
+            axes_out = [funscript._axis_name(axis)]
+        results.append({
+            "axis": axis, "path": str(fp),
+            "ok": v["ok"], "errors": v["errors"], "warnings": v["warnings"],
+            "count": v["count"], "axes": axes_out,
+        })
+    return jsonify({"ok": True, "all_ok": all_ok, "files": results})
+
+
+@app.post("/api/scripts/export")
+def scripts_export():
+    """脚本输出：把多轴脚本合并成单个多轴 funscript。"""
+    body = request.get_json(force=True, silent=True) or {}
+    vid = int(body.get("video_id", 0) or 0)
+    out = (body.get("out") or "").strip()
+    if not vid:
+        return jsonify({"ok": False, "error": "参数缺失"}), 400
+    row = _get_row(vid)
+    if row is None:
+        return jsonify({"ok": False, "error": "视频不存在"}), 404
+    if not out:
+        out = str(Path(row["path"]).with_suffix("")) + ".merged.funscript"
+    try:
+        r = funscript.merge(row["path"], out)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"导出失败：{e}"}), 500
+    code = 200 if r.get("ok") else 403
+    return jsonify(r), code
 
 
 # ---------- 分组 ----------
@@ -1070,10 +1236,21 @@ def videos_delete():
 
     store = _store()
     try:
-        cache_dirs = [r["cache_dir"] for r in (store.get_by_id(i) for i in ids) if r]
+        rows = [store.get_by_id(i) for i in ids]
+        cache_dirs = [r["cache_dir"] for r in rows if r]
+        paths = [r["path"] for r in rows if r]
         store.delete_videos(ids)
     finally:
         store.close()
+    # 脚本处理：非源视频的同级脚本移到 待回收/<文件名>/；源备份保留不动
+    recycled: list[str] = []
+    for video_path in paths:
+        try:
+            if scripts.has_source(video_path):
+                continue  # 有源备份：master 保留
+            recycled.extend(str(x) for x in scripts.recycle_sibling_scripts(video_path))
+        except Exception:
+            pass
     # 同步清理磁盘：只删缓存目录内的子目录，越界路径一律跳过（绝不碰缓存外的源码）
     cache_root = Path(_current_cache_dir()).resolve()
     for cd in cache_dirs:
@@ -1091,7 +1268,7 @@ def videos_delete():
                 f.unlink(missing_ok=True)
             except Exception:
                 pass
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "recycled": recycled})
 
 
 @app.post("/api/videos/reextract")
@@ -1208,9 +1385,13 @@ def clear_all():
     cd = _current_cache_dir()
     if not cd:
         return jsonify({"ok": False, "error": "尚未设置缓存目录"}), 400
-    with _lock:
-        if _state["running"]:
-            return jsonify({"ok": False, "error": "有任务正在运行，请先取消"}), 409
+    store = _store()
+    try:
+        running = bool(store.task_by_state("running"))
+    finally:
+        store.close()
+    if running:
+        return jsonify({"ok": False, "error": "有任务正在运行，请先取消"}), 409
     cfg = _cfg()
     try:
         pipeline.clear_all(cfg)
@@ -1268,10 +1449,52 @@ def status():
     return jsonify(_snapshot())
 
 
+@app.get("/api/tasks")
+def tasks():
+    store = _store()
+    try:
+        rows = store.list_tasks(limit=100)
+    finally:
+        store.close()
+    return jsonify({"tasks": [_task_summary(t) for t in rows]})
+
+
+@app.get("/api/tasks/<int:task_id>")
+def task_detail(task_id):
+    store = _store()
+    try:
+        t = store.get_task(task_id)
+    finally:
+        store.close()
+    if not t:
+        return jsonify({"ok": False, "error": "任务不存在"}), 404
+    return jsonify({"task": _task_summary(t), "log": json.loads(t["log"] or "[]")})
+
+
+@app.get("/api/events")
+def events():
+    """SSE：实时推送状态/进度/日志变化，替代前端 700ms 轮询。"""
+    def gen():
+        last_sig = None
+        while True:
+            snap = _snapshot()
+            sig = (
+                snap["running"], snap["progress"], snap["total"],
+                snap["stage"], snap["name"], snap["error"], len(snap["log"]),
+            )
+            if sig != last_sig:
+                last_sig = sig
+                yield f"data: {json.dumps(snap, ensure_ascii=False)}\n\n"
+            time.sleep(0.15)
+    return Response(gen(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+
+
 @app.post("/api/cancel")
 def cancel():
-    with _lock:
-        _state["cancel"] = True
+    _task_cancel["flag"] = True
     return jsonify({"ok": True})
 
 
@@ -1359,6 +1582,7 @@ INDEX_HTML = r"""<!doctype html>
   button.small { padding:5px 10px; font-size:12px; }
   button.toggle { background:#1c222d; border:1px solid var(--line); color:var(--dim); }
   button.toggle.on { color:#fff; background:var(--accent); border-color:var(--accent); }
+  button.btn-ok { background:rgba(75,208,138,0.22); border:1px solid var(--ok); color:var(--ok); opacity:1; }
   input[type=text] { background:#0c0f15; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:8px 10px; font-size:13px; }
   input[type=text]:focus { outline:1px solid var(--accent); }
   input[type=checkbox] { accent-color: var(--accent); cursor:pointer; }
@@ -1431,11 +1655,16 @@ INDEX_HTML = r"""<!doctype html>
   .msel-panel.open { display:block; }
   .msel-panel label { display:flex; gap:7px; align-items:center; padding:4px 8px; cursor:pointer; font-size:13px; border-radius:6px; }
   .msel-panel label:hover { background:#1c222d; }
-  .ss-item { display:flex; align-items:center; gap:10px; padding:8px; border:1px solid var(--line); border-radius:10px; cursor:pointer; }
+  #script-select-modal { gap:16px; }
+  #script-select-modal .modal-box { margin:0; }
+  .ss-preview-panel { width:380px; max-width:30vw; flex-shrink:0; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 12px 40px rgba(0,0,0,.5); max-height:90vh; overflow:auto; display:flex; flex-direction:column; }
+  .ss-item { display:flex; flex-direction:column; gap:6px; padding:8px; border:1px solid var(--line); border-radius:10px; cursor:pointer; }
   .ss-item:hover { border-color: var(--ok); }
-  .ss-item img { width:96px; height:64px; object-fit:cover; border-radius:6px; background:#0a0d12; }
+  .ss-item.active { border-color: var(--accent); background: rgba(91,140,255,0.10); box-shadow: 0 0 0 2px rgba(91,140,255,.40); }
+  .ss-item video { width:100%; aspect-ratio:16/10; object-fit:cover; border-radius:6px; background:#0a0d12; }
   .ss-item .ss-info { flex:1; min-width:0; }
-  .ss-item .ss-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ss-item .ss-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+  .ss-item .ss-actions { display:flex; gap:6px; }
   .cmp-axis { display:flex; align-items:center; gap:8px; margin:4px 0; }
   .cmp-axis .lbl { width:28px; font-size:12px; color:#8a93a6; }
   .cmp-axis .bar { flex:1; height:14px; background:#141920; border-radius:7px; overflow:hidden; }
@@ -1445,13 +1674,18 @@ INDEX_HTML = r"""<!doctype html>
   #preview-modal { z-index: 120; }
   #script-select-modal { z-index: 125; }
   #compare-modal { z-index: 126; }
-  .detail-box { width:min(880px, 94vw); }
+  .detail-box { width:min(920px, 94vw); }
   .detail-body { display:flex; gap:16px; align-items:flex-start; }
-  .detail-thumb { width:300px; max-height:220px; object-fit:contain; border-radius:10px; background:#000; flex-shrink:0; }
-  .detail-info { flex:1; font-size:13px; min-width:0; }
-  .di-row { display:flex; gap:10px; padding:5px 0; border-bottom:1px dashed #1e2430; }
-  .di-row span { color:var(--dim); width:62px; flex-shrink:0; }
-  .di-row b { font-weight:500; word-break:break-all; }
+  .detail-thumb { width:320px; max-height:240px; object-fit:contain; border-radius:10px; background:#000; flex-shrink:0; }
+  .detail-info { flex:1; min-width:0; font-size:13px; display:grid; grid-template-columns:1fr 1fr; gap:0 18px; }
+  .di-row { display:flex; gap:8px; padding:5px 0; border-bottom:1px dashed #1e2430; min-width:0; }
+  .di-row span { color:var(--dim); flex-shrink:0; }
+  .di-row b { font-weight:500; word-break:break-all; min-width:0; }
+  .di-row.full { grid-column:1 / -1; }
+  #script-panel { margin-top:14px; }
+  .script-head { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .script-head .muted { font-size:12px; }
+  .detail-actions { margin-top:14px; gap:8px; }
   .card .name { cursor:pointer; }
   .card .name:hover { color:#8fb0ff; text-decoration:underline; }
   #play-modal { z-index: 130; }
@@ -1472,6 +1706,35 @@ INDEX_HTML = r"""<!doctype html>
   .skel-stage canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1; }
   .list-name { cursor:pointer; }
   .list-name:hover { color:#8fb0ff; text-decoration:underline; }
+
+  /* 左下角任务加载指示器 + hover 浮窗 */
+  #task-spinner { position:fixed; right:16px; bottom:16px; width:44px; height:44px; z-index:10000; }
+  #task-spinner.hidden { display:none; }
+  .spinner-ring { width:44px; height:44px; border-radius:50%; border:4px solid rgba(91,140,255,0.22); border-top-color:var(--accent); animation:dcspin 0.8s linear infinite; }
+  @keyframes dcspin { to { transform:rotate(360deg); } }
+  .task-hover { position:absolute; right:56px; bottom:0; width:280px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; box-shadow:0 10px 32px rgba(0,0,0,0.55); opacity:0; visibility:hidden; transform:translateY(6px); transition:opacity .16s, transform .16s, visibility .16s; pointer-events:none; z-index:10001; }
+  #task-spinner:hover .task-hover { opacity:1; visibility:visible; transform:translateY(0); }
+  .th-title { font-weight:600; margin-bottom:2px; }
+  .th-stage { font-size:12px; color:var(--dim); min-height:16px; word-break:break-all; }
+  .th-bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin:8px 0 6px; }
+  .th-bar > div { height:100%; background:var(--accent); border-radius:3px; width:0%; transition:width .3s; }
+  .th-count { font-size:12px; color:var(--dim); }
+
+  /* 任务页 */
+  .tasks-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
+  .tasks-head h2 { margin:0; }
+  .task-item { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:10px; background:var(--panel); }
+  .task-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .task-row b { margin-left:2px; }
+  .task-row .grow { flex:1; }
+  .badge.running { color:var(--warn); }
+  .badge.bad { color:var(--bad); }
+  .badge.dim { color:var(--dim); }
+  .task-detail { margin-top:10px; border-top:1px dashed var(--line); padding-top:10px; }
+  .task-detail.hidden { display:none; }
+  .task-vid { display:flex; gap:8px; align-items:center; padding:3px 0; font-size:12px; }
+  .task-vid .nm { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .task-log { margin-top:10px; background:#0a0d12; border-radius:6px; padding:8px 10px; max-height:220px; overflow:auto; font:11px/1.5 monospace; white-space:pre-wrap; color:var(--dim); }
 </style>
 </head>
 <body>
@@ -1482,6 +1745,7 @@ INDEX_HTML = r"""<!doctype html>
       <button class="nav active" data-view="library"><span class="n">▤</span>原文件</button>
       <button class="nav" data-view="music"><span class="n">♪</span>音频分组</button>
       <button class="nav" data-view="dance"><span class="n">✣</span>动作分组</button>
+      <button class="nav" data-view="tasks"><span class="n">📋</span>任务</button>
       <button class="nav" data-view="test"><span class="n">🧪</span>测试</button>
     </nav>
     <div class="foot">
@@ -1522,7 +1786,6 @@ INDEX_HTML = r"""<!doctype html>
         <div class="row">
           <button id="btn-import-folder">导入文件夹</button>
           <button id="btn-import-videos" class="ghost">导入视频</button>
-          <button id="btn-run" class="ghost">开始识别</button>
           <button id="btn-cancel" class="ghost" disabled>取消</button>
           <span style="flex:1"></span>
           <button id="btn-new-cat" class="ghost">＋ 新建分类</button>
@@ -1592,6 +1855,16 @@ INDEX_HTML = r"""<!doctype html>
       <h2>动作分组</h2>
       <p class="sub">在每组音乐内按舞蹈动作再分。组名可点击改名。</p>
       <div id="dance-groups"></div>
+    </div>
+
+    <!-- 任务 -->
+    <div class="view" id="view-tasks">
+      <div class="tasks-head">
+        <h2>任务</h2>
+        <button id="btn-tasks-refresh" class="ghost small">刷新</button>
+      </div>
+      <p class="sub">提交的识别任务及每个视频的处理状态（完成 / 未处理 / 成功 / 失败）。</p>
+      <div id="tasks-list"></div>
     </div>
 
     <!-- 测试 -->
@@ -1672,6 +1945,17 @@ INDEX_HTML = r"""<!doctype html>
 
     </div>
   </main>
+
+  <!-- 左下角任务加载指示器 -->
+  <div id="task-spinner" class="hidden">
+    <div class="spinner-ring"></div>
+    <div class="task-hover">
+      <div class="th-title" id="task-hover-title">任务处理中</div>
+      <div class="th-stage" id="task-hover-stage"></div>
+      <div class="th-bar"><div id="task-hover-fill"></div></div>
+      <div class="th-count" id="task-hover-count"></div>
+    </div>
+  </div>
 </div>
 
 <div class="modal" id="preview-modal" style="display:none">
@@ -1702,16 +1986,17 @@ INDEX_HTML = r"""<!doctype html>
     <div class="detail-body">
       <video id="detail-video" class="detail-thumb" controls playsinline preload="metadata"></video>
       <div class="detail-info" id="detail-info"></div>
-      <div class="panel" id="script-panel" style="margin-top:12px">
-        <b>脚本管理</b>
-        <div id="script-status" class="muted" style="margin-top:6px">加载中…</div>
-        <div class="row" style="margin-top:8px;gap:8px">
-          <button id="script-select-btn" class="ghost small">切换/关联脚本</button>
-          <button id="script-import-btn" class="ghost small">导入源脚本</button>
-        </div>
+    </div>
+    <div class="panel" id="script-panel">
+      <div class="script-head"><b>脚本管理</b><span id="script-status" class="muted">加载中…</span></div>
+      <div class="row" style="gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button id="script-select-btn" class="ghost small">切换/关联脚本</button>
+        <button id="script-import-btn" class="ghost small">导入源脚本</button>
+        <button id="script-validate-btn" class="ghost small">校验脚本</button>
+        <button id="script-export-btn" class="ghost small">导出脚本</button>
       </div>
     </div>
-    <div class="row" style="margin-top:14px">
+    <div class="row detail-actions">
       <button id="detail-preview">预览</button>
       <button id="detail-reextract" class="ghost">重新提取</button>
       <button id="detail-delete" class="ghost" style="color:var(--bad)">删除</button>
@@ -1720,14 +2005,20 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <div class="modal" id="script-select-modal" style="display:none">
-  <div class="modal-box" style="max-width:920px;max-height:90vh;display:flex;flex-direction:column">
+  <div class="modal-box" style="width:min(880px,56vw);max-height:90vh;display:flex;flex-direction:column">
     <div class="modal-head"><b>选择源脚本</b><button class="ghost small" id="script-select-close">✕ 关闭</button></div>
     <div class="row" style="gap:8px;flex-wrap:wrap;margin:10px 0">
       <input id="ss-name" placeholder="文件名搜索" style="flex:1;min-width:140px;background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px">
       <select id="ss-music" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px"><option value="">全部音乐组</option></select>
       <select id="ss-dance" style="background:#1c222d;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px"><option value="">全部动作组</option></select>
     </div>
-    <div id="ss-list" style="overflow:auto;flex:1;display:flex;flex-direction:column;gap:8px"></div>
+    <div id="ss-list" style="overflow:auto;flex:1;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;align-content:start"></div>
+  </div>
+  <div class="ss-preview-panel">
+    <b>当前要关联的视频</b>
+    <div id="ss-cur-name" class="muted" style="margin:6px 0"></div>
+    <video id="ss-cur-video" autoplay loop muted playsinline style="width:100%;border-radius:8px;background:#000;max-height:460px"></video>
+    <div id="ss-cur-info" class="muted" style="margin-top:8px;font-size:12px"></div>
   </div>
 </div>
 
@@ -1735,10 +2026,10 @@ INDEX_HTML = r"""<!doctype html>
   <div class="modal-box" style="max-width:1120px;max-height:92vh;overflow:auto">
     <div class="modal-head"><b id="compare-name"></b><button class="ghost small" id="compare-close">✕ 关闭</button></div>
     <div class="row" style="gap:10px;align-items:stretch">
-      <div class="panel" style="flex:1;min-width:0"><b>当前视频</b><video id="cmp-v1" controls playsinline style="width:100%;max-height:300px;background:#000"></video></div>
-      <div class="panel" style="flex:1;min-width:0"><b>源视频</b><video id="cmp-v2" controls playsinline style="width:100%;max-height:300px;background:#000"></video></div>
+      <div class="panel" style="flex:1;min-width:0"><b>当前视频</b><video id="cmp-v1" controls playsinline preload="metadata" style="width:100%;max-height:300px;background:#000"></video></div>
+      <div class="panel" style="flex:1;min-width:0"><b>源视频</b><video id="cmp-v2" controls playsinline preload="metadata" style="width:100%;max-height:300px;background:#000"></video></div>
     </div>
-    <div class="panel" style="margin-top:10px"><b>OSR6 虚拟播放</b><div id="cmp-osr6" style="height:320px;background:#0a0d12;border-radius:8px;overflow:hidden;margin-top:6px"></div></div>
+    <div class="panel" style="margin-top:10px"><b>OSR6 虚拟播放</b><div id="cmp-osr6" style="height:320px;background:#0a0d12;border-radius:8px;overflow:hidden;margin-top:6px"></div><div id="cmp-osr6-status" class="muted" style="margin-top:6px;font-size:12px;font-family:monospace"></div></div>
     <div class="panel" style="margin-top:10px"><div id="cmp-axes"></div></div>
     <div class="row" style="margin-top:12px;justify-content:flex-end;gap:8px">
       <button id="cmp-activate">激活此脚本</button>
@@ -1813,6 +2104,7 @@ async function switchView(name) {
   if (name==="dance") loadGroups("dance");
   if (name==="library") refreshLibrary();
   if (name==="settings") refreshConfig();
+  if (name==="tasks") loadTasks();
   if (name==="test") {
     if (!st.videos.length) await refreshLibrary();
     testPopulate();
@@ -1872,13 +2164,22 @@ function applyRunUI(running) {
   const run = running || !st.configured;
   $("#btn-import-folder").disabled = run;
   $("#btn-import-videos").disabled = run;
-  $("#btn-run").disabled = run;
   $("#btn-cancel").disabled = !running;
 }
+let _es = null;
 function beginPolling() {
+  if (_es) { poll(); return; }
   poll();
-  if (st.timer) clearInterval(st.timer);
-  st.timer = setInterval(poll, 700);
+  _es = new EventSource("/api/events");
+  _es.onmessage = (e) => {
+    try {
+      const s = JSON.parse(e.data);
+      const wasRunning = st.running;
+      applyStatus(s);
+      if (wasRunning && !s.running) refreshLibrary();
+    } catch (_) {}
+  };
+  _es.onerror = () => {};
 }
 document.getElementById("btn-import-folder").addEventListener("click", async () => {
   const r = await post("/api/pick_folder", {});
@@ -1894,17 +2195,11 @@ document.getElementById("btn-import-videos").addEventListener("click", async () 
   if (a.ok) { beginPolling(); }
   else alert(a.error || "启动失败");
 });
-document.getElementById("btn-run").addEventListener("click", async () => {
-  const r = await post("/api/run", {});
-  if (!r.ok) { alert(r.error || "启动失败"); return; }
-  beginPolling();
-});
 document.getElementById("btn-cancel").addEventListener("click", async () => {
   await post("/api/cancel");
   $("#btn-cancel").disabled = true;
 });
-async function poll() {
-  const s = await api("/api/status");
+function applyStatus(s) {
   st.running = s.running;
   const pct = s.total ? Math.round(100 * s.progress / s.total) : 0;
   $("#fill").style.width = pct + "%";
@@ -1918,11 +2213,75 @@ async function poll() {
     $("#status").textContent = s.stage || "就绪";
   }
   applyRunUI(s.running);
-  if (!s.running) {
-    if (st.timer) { clearInterval(st.timer); st.timer = null; }
-    refreshLibrary();
+  // 左下角 spinner + hover 浮窗
+  const spin = $("#task-spinner");
+  if (s.running) {
+    spin.classList.remove("hidden");
+    $("#task-hover-title").textContent = (s.kind === "dance" ? "动作分组" : "音乐分组") + "处理中";
+    $("#task-hover-stage").textContent = s.stage + (s.name ? " · " + s.name : "");
+    $("#task-hover-fill").style.width = pct + "%";
+    $("#task-hover-count").textContent = s.total ? `${s.progress} / ${s.total} · ${pct}%` : "处理中…";
+  } else {
+    spin.classList.add("hidden");
+  }
+  if (s.tasks) {
+    st.tasks = s.tasks;
+    if (document.getElementById("view-tasks").classList.contains("active")) renderTasks(st.tasks);
   }
 }
+
+async function poll() {
+  const s = await api("/api/status");
+  applyStatus(s);
+  return s;
+}
+
+// ---- 任务列表 / 详情 ----
+async function loadTasks() {
+  const r = await api("/api/tasks");
+  st.tasks = r.tasks || [];
+  renderTasks(st.tasks);
+}
+function renderTasks(tasks) {
+  const el = $("#tasks-list");
+  if (!tasks || !tasks.length) { el.innerHTML = '<div class="empty">暂无任务</div>'; return; }
+  el.innerHTML = tasks.map(t => {
+    const stateLabel = {pending:"待处理", running:"处理中", done:"完成", failed:"失败", canceled:"已取消"}[t.state] || t.state;
+    const stateClass = {done:"done", failed:"bad", running:"running", canceled:"dim", pending:"dim"}[t.state] || "dim";
+    const kind = t.kind === "dance" ? "动作分组" : "音乐分组";
+    const sm = (t.detail && t.detail.summary);
+    const summary = sm ? `完成 ${sm.done||0} · 失败 ${sm.error||0} · 未处理 ${sm.pending||0}` : "";
+    return `<div class="task-item" data-id="${t.id}">
+      <div class="task-row">
+        <span class="badge ${stateClass}">${stateLabel}</span>
+        <b>${kind}</b>
+        <span class="dim grow">#${t.id} · ${t.created_at||""}</span>
+        ${summary ? `<span class="dim">${summary}</span>` : ""}
+        <button class="ghost small task-toggle" data-id="${t.id}">详情</button>
+      </div>
+      <div class="task-detail hidden" id="task-detail-${t.id}"></div>
+    </div>`;
+  }).join("");
+  el.querySelectorAll(".task-toggle").forEach(b => b.addEventListener("click", () => toggleTaskDetail(parseInt(b.dataset.id))));
+}
+async function toggleTaskDetail(id) {
+  const box = $("#task-detail-" + id);
+  if (!box.classList.contains("hidden")) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  box.innerHTML = '<div class="dim">加载中…</div>';
+  const r = await api("/api/tasks/" + id);
+  if (!r.task) { box.innerHTML = '<div class="dim">加载失败</div>'; return; }
+  const t = r.task;
+  const vids = (t.detail && t.detail.videos) || [];
+  const vStatus = {ok:"完成", no_pose:"完成(无骨架)", extracting:"处理中", pending:"未处理", error:"失败"};
+  const vCls = {ok:"done", no_pose:"done", extracting:"running", pending:"dim", error:"bad"};
+  const vidHtml = vids.length
+    ? vids.map(v => `<div class="task-vid"><span class="badge ${vCls[v.status]||"dim"}">${vStatus[v.status]||v.status}</span><span class="nm" title="${esc(v.name)}">${esc(v.name)}</span></div>`).join("")
+    : '<div class="dim">（无逐视频详情）</div>';
+  const logHtml = (r.log && r.log.length) ? `<div class="task-log">${r.log.map(esc).join("\n")}</div>` : "";
+  box.innerHTML = vidHtml + logHtml;
+}
+document.getElementById("btn-tasks-refresh").addEventListener("click", loadTasks);
 
 // ---- 原文件：视频浏览（多选）----
 document.getElementById("btn-new-cat").addEventListener("click", async () => {
@@ -1965,7 +2324,10 @@ document.getElementById("btn-delete").addEventListener("click", async () => {
   if (!confirm2(`从库里删除选中的 ${st.sel.size} 个视频？（不会删除源文件）`,
                 "再次确认：确定删除？缓存和缩略图也会一并清理。")) return;
   const r = await post("/api/videos/delete", {ids:[...st.sel]});
-  if (r.ok) { st.sel.clear(); refreshLibrary(); }
+  if (r.ok) {
+    if (r.recycled && r.recycled.length) alert(`已删除，并把 ${r.recycled.length} 个关联脚本移入「待回收」文件夹`);
+    st.sel.clear(); refreshLibrary();
+  }
 });
 document.getElementById("btn-assign").addEventListener("click", async () => {
   if (!st.sel.size) { alert("请先勾选视频"); return; }
@@ -2642,14 +3004,14 @@ async function showDetail(id) {
   $("#detail-name").textContent = d.name;
   $("#detail-video").src = "/api/video/" + id;
   const fsLines = (d.funscript_axes || []).map(a =>
-    `<div class="di-row"><span>${esc(a.axis)}</span><b>${a.count} 个动作 · ${(a.duration_ms/1000).toFixed(1)}s · 速度 ${a.speed}</b></div>`
+    `<div class="di-row"><span>${esc(a.axis)}</span><b>${a.count} 动作 · ${(a.duration_ms/1000).toFixed(1)}s · 速度 ${a.speed}</b></div>`
   ).join("");
   $("#detail-info").innerHTML = `
-    <div class="di-row"><span>路径</span><b>${esc(d.path)}</b></div>
+    <div class="di-row full"><span>路径</span><b>${esc(d.path)}</b></div>
     <div class="di-row"><span>分辨率</span><b>${d.width}×${d.height} @ ${d.fps}fps</b></div>
     <div class="di-row"><span>时长</span><b>${d.duration}s</b></div>
-    <div class="di-row"><span>音乐</span><b>${stateBadge("音乐", d.music_state)}</b></div>
-    <div class="di-row"><span>动作</span><b>${stateBadge("动作", d.dance_state)}</b></div>
+    <div class="di-row"><span>音乐状态</span><b>${stateBadge("音乐", d.music_state)}</b></div>
+    <div class="di-row"><span>动作状态</span><b>${stateBadge("动作", d.dance_state)}</b></div>
     <div class="di-row"><span>音乐组</span><b>${esc(d.music_name || "-")}</b></div>
     <div class="di-row"><span>动作组</span><b>${esc(d.dance_name || "-")}</b></div>
     <div class="di-row"><span>BPM</span><b>${d.tempo || "-"}</b></div>
@@ -2691,6 +3053,7 @@ document.getElementById("detail-delete").addEventListener("click", async () => {
   if (!confirm2("删除这个视频（含缓存/缩略图，不影响源文件）？", "再次确认：确定删除？")) return;
   const r = await post("/api/videos/delete", {ids:[st.detailId]});
   if (!r.ok) { alert(r.error||"失败"); return; }
+  if (r.recycled && r.recycled.length) alert(`已删除，并把 ${r.recycled.length} 个关联脚本移入「待回收」文件夹`);
   $("#detail-modal").style.display = "none";
   st.sel.delete(st.detailId);
   refreshLibrary();
@@ -2788,6 +3151,21 @@ async function openScriptSelect() {
   $("#ss-music").innerHTML = `<option value="">全部音乐组</option>` + mus.map(g => `<option value="${g}">音乐组 ${g}</option>`).join("");
   $("#ss-dance").innerHTML = `<option value="">全部动作组</option>` + dan.map(g => `<option value="${g}">动作组 ${g}</option>`).join("");
   if (d.music_group != null) $("#ss-music").value = String(d.music_group);
+  // 右侧：当前要关联的视频动态预览
+  $("#ss-cur-name").textContent = $("#detail-name").textContent || "";
+  const v = $("#ss-cur-video");
+  v.src = "/api/clip/" + st.detailId;
+  v.onerror = () => { v.onerror = null; v.src = "/api/video/" + st.detailId; };
+  v.load();
+  v.play().catch(() => {});
+  $("#ss-cur-info").textContent = "加载脚本信息…";
+  api("/api/funscript/" + st.detailId).then(fd => {
+    if (fd.ok && fd.axes && fd.axes.length) {
+      $("#ss-cur-info").textContent = "当前脚本：" + fd.axes.map(a => a.axis + "(" + a.count + ")").join(" · ");
+    } else {
+      $("#ss-cur-info").textContent = "当前无关联脚本";
+    }
+  }).catch(() => { $("#ss-cur-info").textContent = ""; });
   renderScriptList();
 }
 
@@ -2804,16 +3182,21 @@ function renderScriptList() {
   });
   const el = $("#ss-list");
   if (!list.length) { el.innerHTML = `<div class="muted" style="padding:14px">没有匹配的源视频</div>`; return; }
-  el.innerHTML = list.map(p => `
-    <div class="ss-item">
-      <img src="/api/skeleton_gif/${p.id}" loading="lazy" onerror="this.style.visibility='hidden'">
+  el.innerHTML = list.map(p => {
+    const isActive = d.active_source != null && p.id === d.active_source;
+    return `
+    <div class="ss-item${isActive ? " active" : ""}">
+      <video class="ss-thumb" src="/api/thumb_mp4/${p.id}" poster="/api/thumb/${p.id}" loop muted playsinline autoplay preload="auto" onerror="this.style.visibility='hidden'"></video>
       <div class="ss-info">
-        <div class="ss-name">${esc(p.name)}</div>
-        <div class="muted" style="font-size:12px">${p.funscript_count} 轴 ${(p.funscript_axes||[]).map(esc).join("/")} · 音乐组 ${p.music_group ?? "-"} · 动作组 ${p.dance_group ?? "-"}</div>
+        <div class="ss-name">${isActive ? '<span class="badge done">当前</span> ' : ""}${esc(p.name)}</div>
+        <div class="muted" style="font-size:11px">${p.funscript_count} 轴 · ${(p.funscript_axes||[]).map(esc).join("/")}</div>
       </div>
-      <button class="ghost small" data-cmp="${p.id}">对比</button>
-      <button class="ghost small" data-act="${p.id}">激活</button>
-    </div>`).join("");
+      <div class="ss-actions">
+        <button class="ghost small" data-cmp="${p.id}">对比</button>
+        ${isActive ? '<button class="small btn-ok" disabled>已激活</button>' : `<button class="ghost small" data-act="${p.id}">激活</button>`}
+      </div>
+    </div>`;
+  }).join("");
   el.querySelectorAll("[data-act]").forEach(b => b.addEventListener("click", () => activateScript(+b.dataset.act)));
   el.querySelectorAll("[data-cmp]").forEach(b => b.addEventListener("click", () => openCompare(+b.dataset.cmp)));
 }
@@ -2837,6 +3220,27 @@ async function importSource() {
   refreshLibrary();
 }
 
+async function validateScript() {
+  if (!st.detailId) return;
+  const r = await post("/api/scripts/validate", { video_id: st.detailId });
+  if (!r.ok) { alert(r.error || "校验失败"); return; }
+  if (!r.files || !r.files.length) { alert("没有关联脚本"); return; }
+  const lines = r.files.map(f => {
+    const tag = f.axis === "main" ? "主轴" : f.axis;
+    let line = tag + ": " + (f.ok ? "✓ 正常" : "✗ " + f.errors.join("；"));
+    if (f.warnings && f.warnings.length) line += "（" + f.warnings.length + " 个警告）";
+    return line + " · " + f.count + " 个动作";
+  });
+  alert((r.all_ok ? "✅ 全部脚本校验通过\n\n" : "⚠️ 发现问题\n\n") + lines.join("\n"));
+}
+
+async function exportScript() {
+  if (!st.detailId) return;
+  const r = await post("/api/scripts/export", { video_id: st.detailId });
+  if (!r.ok) { alert(r.error || "导出失败"); return; }
+  alert("已导出 " + r.count + " 个轴到：\n" + r.path + (r.errors && r.errors.length ? "\n\n跳过：" + r.errors.join("；") : ""));
+}
+
 async function openCompare(srcId) {
   cmpSrcId = srcId;
   const targetId = st.detailId;
@@ -2848,19 +3252,56 @@ async function openCompare(srcId) {
   const d = await api("/api/funscript/" + srcId);
   cmpAxes = (d.axes || []).filter(a => a.actions && a.actions.length);
   await initCmpEmu();
-  const sync = (from, to) => { try { to.currentTime = from.currentTime; } catch (e) {} };
-  v1.onplay = () => { sync(v1, v2); v2.play(); };
-  v2.onplay = () => { sync(v2, v1); v1.play(); };
+  // 只有时间差超过阈值才同步，避免 v1/v2 互相 seek 造成死循环卡顿
+  const sync = (from, to) => {
+    try {
+      const d = Math.abs((to.currentTime || 0) - (from.currentTime || 0));
+      if (d > 0.3) to.currentTime = from.currentTime;
+    } catch (e) {}
+  };
+  v1.onplay = () => { sync(v1, v2); v2.play().catch(()=>{}); };
+  v2.onplay = () => { sync(v2, v1); v1.play().catch(()=>{}); };
   v1.onpause = () => v2.pause();
   v2.onpause = () => v1.pause();
   v1.onseeked = () => sync(v1, v2);
   v2.onseeked = () => sync(v2, v1);
-  function tick() {
+  // 模拟器自己的时钟：跟随视频播放/暂停，但不逐帧读 currentTime（浏览器更新粗，会跳）
+  let simT = 0;
+  function tick(now) {
     if ($("#compare-modal").style.display === "none") return;
-    const t = (v1.currentTime || 0) * 1000;
-    const vals = sampleCmpAxes(t);
-    writeCmpEmu(vals);
-    drawCmpAxes(vals);
+    const dt = tick._prev ? Math.min((now - tick._prev) / 1000, 0.1) : 0;
+    tick._prev = now;
+    if (!v1.paused && !v1.ended) simT += dt;
+    const t = simT * 1000;
+    try {
+      // 模拟器每帧写，动作才平滑
+      const vals = sampleCmpAxes(t);
+      writeCmpEmu(vals);
+      // 进度条/状态行限流到 ~10fps，减少 DOM 开销
+      if (!tick._uiLast || now - tick._uiLast >= 100) {
+        tick._uiLast = now;
+        drawCmpAxes(vals);
+      }
+      if (!tick._stLast || now - tick._stLast >= 200) {
+        tick._stLast = now;
+        const st = $("#cmp-osr6-status");
+        if (st) {
+          if (!cmpEmu) st.textContent = "模拟器未加载";
+          else {
+            const ea = cmpEmu.axes || {};
+            st.textContent = "t=" + (t / 1000).toFixed(1) + "s · L0=" + (ea.L0 != null ? ea.L0.toFixed(2) : "-")
+              + " L1=" + (ea.L1 != null ? ea.L1.toFixed(2) : "-")
+              + " L2=" + (ea.L2 != null ? ea.L2.toFixed(2) : "-")
+              + " R0=" + (ea.R0 != null ? ea.R0.toFixed(2) : "-")
+              + " R1=" + (ea.R1 != null ? ea.R1.toFixed(2) : "-")
+              + " R2=" + (ea.R2 != null ? ea.R2.toFixed(2) : "-");
+          }
+        }
+      }
+    } catch (err) {
+      const st = $("#cmp-osr6-status");
+      if (st) st.textContent = "tick 异常：" + (err && err.message ? err.message : err);
+    }
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
@@ -2873,9 +3314,19 @@ function sampleCmpAxes(t) {
     if (!(ax in vals)) continue;
     const acts = a.actions;
     if (!acts || !acts.length) continue;
+    // 二分找到 t 所在的动作区间
     let lo = 0, hi = acts.length - 1, idx = 0;
     while (lo <= hi) { const m = (lo + hi) >> 1; if (acts[m][0] <= t) { idx = m; lo = m + 1; } else hi = m - 1; }
-    vals[ax] = acts[idx][1];
+    if (idx >= acts.length - 1) {
+      vals[ax] = acts[idx][1];
+    } else {
+      // funscript 标准：相邻动作间线性插值，避免阶跃卡顿
+      const t0 = acts[idx][0], p0 = acts[idx][1];
+      const t1 = acts[idx + 1][0], p1 = acts[idx + 1][1];
+      const span = t1 - t0;
+      const r = span > 0 ? Math.max(0, Math.min(1, (t - t0) / span)) : 0;
+      vals[ax] = p0 + (p1 - p0) * r;
+    }
   }
   return vals;
 }
@@ -2885,9 +3336,12 @@ async function initCmpEmu() {
   if (cmpEmu) return;
   try {
     const mod = await import("/vendor/osr-emu/osr-emu.dist.module.min.js");
-    cmpEmu = new mod.OSREmulator(el, { model: "SR6" });
+    cmpEmu = new mod.OSREmulator(el, { model: "SR6", scale: { L0: 2 } });
+    setTimeout(() => { try { window.dispatchEvent(new Event("resize")); } catch (e) {} }, 80);
   } catch (e) {
     el.innerHTML = `<div class="muted" style="padding:14px">模拟器加载失败</div>`;
+    const st = $("#cmp-osr6-status");
+    if (st) st.textContent = "加载失败：" + (e && e.message ? e.message : e);
   }
 }
 
@@ -2903,12 +3357,23 @@ function writeCmpEmu(vals) {
 
 function drawCmpAxes(vals) {
   const colors = { L0: "#5b8cff", L1: "#4bd08a", L2: "#ffb454", R0: "#ff6b6b", R1: "#b48cff", R2: "#e88cff" };
-  $("#cmp-axes").innerHTML = Object.keys(colors).map(a => `
-    <div class="cmp-axis">
-      <div class="lbl">${a}</div>
-      <div class="bar"><div class="fill" style="width:${vals[a]}%;background:${colors[a]}"></div></div>
-      <div class="lbl" style="width:34px;text-align:right">${Math.round(vals[a])}</div>
-    </div>`).join("");
+  const el = $("#cmp-axes");
+  if (!el.dataset.built) {
+    el.innerHTML = Object.keys(colors).map(a => `
+      <div class="cmp-axis" data-axis="${a}">
+        <div class="lbl">${a}</div>
+        <div class="bar"><div class="fill" style="width:0%;background:${colors[a]}"></div></div>
+        <div class="lbl val" style="width:34px;text-align:right">0</div>
+      </div>`).join("");
+    el.dataset.built = "1";
+  }
+  for (const a of Object.keys(colors)) {
+    const row = el.querySelector('[data-axis="' + a + '"]');
+    if (!row) continue;
+    const v = Math.round(vals[a] || 50);
+    row.querySelector(".fill").style.width = v + "%";
+    row.querySelector(".val").textContent = v;
+  }
 }
 
 function closeCompare() {
@@ -2919,6 +3384,8 @@ function closeCompare() {
 
 $("#script-select-btn").addEventListener("click", openScriptSelect);
 $("#script-import-btn").addEventListener("click", importSource);
+$("#script-validate-btn").addEventListener("click", validateScript);
+$("#script-export-btn").addEventListener("click", exportScript);
 $("#script-select-close").addEventListener("click", () => { $("#script-select-modal").style.display = "none"; });
 $("#ss-name").addEventListener("input", renderScriptList);
 $("#ss-music").addEventListener("change", renderScriptList);

@@ -14,6 +14,7 @@ from pathlib import Path
 from . import funscript
 
 BACKUP_DIR = "源脚本备份"
+RECYCLE_DIR = "待回收脚本"
 
 
 def backup_dir_for(video_path: str | Path) -> Path:
@@ -54,11 +55,14 @@ def ensure_source_backup(video_path: str | Path) -> bool:
     if not files:
         return False
     d = backup_dir_for(v)
-    d.mkdir(parents=True, exist_ok=True)
-    for axis, src in files:
-        dst = d / f"{axis}.funscript"
-        if not dst.exists():
-            shutil.copy2(src, dst)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        for axis, src in files:
+            dst = d / f"{axis}.funscript"
+            if not dst.exists():
+                shutil.copy2(src, dst)
+    except OSError:
+        return False  # 源目录只读等情况：备份失败但不影响激活回退
     return True
 
 
@@ -91,18 +95,24 @@ def activate(video_path: str | Path, source_video_path: str | Path) -> bool:
     v = Path(video_path)
     src_dir = backup_dir_for(source_video_path)
     if not src_dir.is_dir():
-        raise FileNotFoundError(f"源脚本备份不存在：{src_dir}")
+        # 备份目录不存在（还没备份 / 源目录只读建不了），先尝试现场备份
+        try:
+            ensure_source_backup(source_video_path)
+        except Exception:
+            pass
+    if src_dir.is_dir():
+        src_axes = [(p.stem, p) for p in sorted(src_dir.glob("*.funscript"))]
+    else:
+        # 备份建不出来时，直接回退用源视频同级的脚本文件
+        src_axes = funscript.find_for(source_video_path)
+    if not src_axes:
+        raise FileNotFoundError(f"源脚本不存在：{source_video_path}")
 
     stem = v.stem
-    files = sorted(src_dir.glob("*.funscript"))
-    if not files:
-        raise FileNotFoundError(f"源脚本备份为空：{src_dir}")
-
     new_targets: set[Path] = set()
     temps: list[tuple[Path, Path]] = []
     try:
-        for p in files:
-            axis = p.stem
+        for axis, p in src_axes:
             suffix = _axis_suffix(axis)
             target = v.with_name(stem + (f".{suffix}" if suffix else "") + ".funscript")
             tmp = v.with_name(target.name + ".tmp")
@@ -112,6 +122,13 @@ def activate(video_path: str | Path, source_video_path: str | Path) -> bool:
         # 统一原子替换
         for tmp, target in temps:
             tmp.replace(target)
+    except PermissionError as e:
+        for tmp, _ in temps:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise PermissionError(f"目标目录没有写入权限，无法激活脚本：{v.parent}") from e
     except Exception:
         for tmp, _ in temps:
             try:
@@ -128,3 +145,30 @@ def activate(video_path: str | Path, source_video_path: str | Path) -> bool:
             except OSError:
                 pass
     return True
+
+
+def recycle_sibling_scripts(video_path: str | Path) -> list[Path]:
+    """把视频同级的脚本移进 待回收脚本/<文件名>/ 下（非源视频删除时用）。
+
+    返回实际移动到的目标路径列表。源目录只读时跳过并返回空。
+    """
+    v = Path(video_path)
+    files = funscript.find_for(v)
+    if not files:
+        return []
+    dest_dir = v.parent / RECYCLE_DIR / v.name
+    moved: list[Path] = []
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return []
+    for _axis, src in files:
+        dst = dest_dir / src.name
+        if dst.exists():
+            continue
+        try:
+            shutil.move(str(src), str(dst))
+            moved.append(dst)
+        except OSError:
+            continue
+    return moved

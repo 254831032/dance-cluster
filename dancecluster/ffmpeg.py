@@ -49,6 +49,18 @@ def _nvenc_available() -> bool:
 _nvenc_warmup_done = False
 
 
+def _hwaccel() -> list[str]:
+    """硬件解码参数（按平台）。4K 解码是代理/预览生成的主要瓶颈，GPU 解码可提速数倍。"""
+    import platform
+
+    sysname = platform.system()
+    if sysname == "Darwin":
+        return ["-hwaccel", "videotoolbox"]
+    if sysname == "Windows":
+        return ["-hwaccel", "cuda"] if _nvenc_available() else ["-hwaccel", "d3d11va"]
+    return ["-hwaccel", "cuda"] if _nvenc_available() else []
+
+
 def nvenc_warmup() -> None:
     """一次性预热 NVENC：在并行 worker 启动前跑一次极小编码，触发驱动级 CUDA 初始化。
 
@@ -157,22 +169,28 @@ def cut_clip(
         need_scale = info["height"] > max_height
 
     if reencode or need_scale:
+        hw = _hwaccel()
         base = [
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+            *hw,
             "-threads", _MAX_THREADS,
             "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
         ]
         if need_scale:
             base += ["-vf", f"scale=-2:{max_height}"]
         tail = ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)]
-        # NVENC 优先；失败（会话数超限/分辨率不支持等）自动回退软编
-        if _nvenc_available():
-            try:
+        # 先试硬件解码（GPU）+ NVENC；失败自动回退
+        try:
+            if _nvenc_available():
                 _run(base + ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"] + tail)
-                return out
-            except RuntimeError:
-                pass
-        _run(base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", _MAX_THREADS] + tail)
+            else:
+                _run(base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", _MAX_THREADS] + tail)
+            return out
+        except RuntimeError:
+            pass
+        # 硬件解码失败（驱动/编码器不支持等）→ 回退纯软解软编
+        base_sw = [x for x in base if x not in set(hw)]
+        _run(base_sw + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", _MAX_THREADS] + tail)
     else:
         _run([
             ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",

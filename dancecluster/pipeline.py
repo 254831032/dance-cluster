@@ -122,9 +122,10 @@ def index_video(
         pass
 
     try:
-        # 1) 切片段（留档，便于人工核对与后续调参）
+        # 1) 切片段：仅当需要骨架（with_pose）时才切。音频分组用不到，预览/测试时按需生成，
+        #    避免主流程白白解码+编码视频（4K 源尤其慢）。
         clip = cdir / "clip.mp4"
-        if not clip.exists():
+        if with_pose and not clip.exists():
             ffmpeg.cut_clip(path, clip, cfg.clip.start, cfg.clip.duration, cfg.clip.reencode, max_height=cfg.clip.max_height)
 
         # 2) 音频（从原视频抽，长度独立于骨架片段）。无音轨则跳过。
@@ -345,6 +346,39 @@ def scan_funscripts(ids: list[int], cfg: AppConfig) -> dict:
         store.close()
 
 
+def _probe_and_register(new_paths: list, cfg: AppConfig, store: Store, progress=None, total: int = 0) -> int:
+    """并行 ffmpeg.probe + 脚本扫描，串行写库。返回新增数。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not new_paths:
+        return 0
+
+    def _probe(p):
+        try:
+            return p, ffmpeg.probe(p), _funscript_fields(p), None
+        except Exception as e:
+            return p, None, None, e
+
+    n_jobs = min(8, max(1, len(new_paths)))
+    added = 0
+    with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+        for i, (p, info, fs, err) in enumerate(ex.map(_probe, new_paths)):
+            if progress:
+                progress(i + 1, total, p.name, "scanning")
+            if err is not None or info is None or fs is None:
+                continue
+            vid = store.upsert_video(
+                path=str(p), name=p.name, duration=info["duration"],
+                width=info["width"], height=info["height"], fps=info["fps"],
+                has_audio=int(bool(info["has_audio"])),
+                cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
+                **fs,
+            )
+            _ensure_own_active(store, vid, int(fs["funscript_count"]) > 0)
+            added += 1
+    return added
+
+
 def _discover(folders: list, cfg: AppConfig, store: Store, progress=None) -> dict:
     """把文件夹里的视频登记为 pending（只登记，不提取）。返回统计。
 
@@ -356,25 +390,15 @@ def _discover(folders: list, cfg: AppConfig, store: Store, progress=None) -> dic
     for folder in folders:
         all_paths.extend(list_videos(folder))
     total = len(all_paths)
-    for idx, p in enumerate(all_paths):
+    new_paths: list[Path] = []
+    for p in all_paths:
         stats["scanned"] += 1
-        if progress:
-            progress(idx + 1, total, p.name, "scanning")
         row = store.get_by_path(str(p))
         if row is None:
-            info = ffmpeg.probe(p)
-            fs = _funscript_fields(p)
-            vid = store.upsert_video(
-                path=str(p), name=p.name, duration=info["duration"],
-                width=info["width"], height=info["height"], fps=info["fps"],
-                has_audio=int(bool(info["has_audio"])),
-                cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
-                **fs,
-            )
-            _ensure_own_active(store, vid, int(fs["funscript_count"]) > 0)
-            stats["added"] += 1
+            new_paths.append(p)
         elif row["status"] in ("ok", "no_pose"):
             stats["already"] += 1
+    stats["added"] = _probe_and_register(new_paths, cfg, store, progress, total)
     return stats
 
 
@@ -391,29 +415,17 @@ def register_videos(paths: list, cfg: AppConfig, progress=None) -> dict:
     store = Store(db_path(cfg))
     stats = {"scanned": 0, "added": 0, "already": 0}
     try:
-        total = len(paths)
-        for idx, p in enumerate(paths):
-            p = Path(p)
-            if p.suffix.lower() not in VIDEO_EXTS:
-                continue
+        valid = [Path(p) for p in paths if Path(p).suffix.lower() in VIDEO_EXTS]
+        total = len(valid)
+        new_paths: list[Path] = []
+        for p in valid:
             stats["scanned"] += 1
-            if progress:
-                progress(idx + 1, total, p.name, "scanning")
             row = store.get_by_path(str(p))
             if row is None:
-                info = ffmpeg.probe(p)
-                fs = _funscript_fields(p)
-                vid = store.upsert_video(
-                    path=str(p), name=p.name, duration=info["duration"],
-                    width=info["width"], height=info["height"], fps=info["fps"],
-                    has_audio=int(bool(info["has_audio"])),
-                    cache_dir=str(_cache_dir(cfg, p.stem)), status="pending",
-                    **fs,
-                )
-                _ensure_own_active(store, vid, int(fs["funscript_count"]) > 0)
-                stats["added"] += 1
+                new_paths.append(p)
             elif row["status"] in ("ok", "no_pose"):
                 stats["already"] += 1
+        stats["added"] = _probe_and_register(new_paths, cfg, store, progress, total)
         return stats
     finally:
         store.close()
@@ -817,6 +829,7 @@ def _music_matrix(audios: list[dict | None], ids: list[int], store: Store, n_job
 
     n = len(audios)
     sim = np.eye(n, dtype=np.float32)
+    cache = store.get_pairs_all("music")  # 一次读全部，避免 N^2 次单查
     pairs = []
     for i in range(n):
         if audios[i] is None:
@@ -824,9 +837,9 @@ def _music_matrix(audios: list[dict | None], ids: list[int], store: Store, n_job
         for j in range(i + 1, n):
             if audios[j] is None:
                 continue
-            v = store.get_pair(ids[i], ids[j], "music")
-            if v is not None:
-                sim[i, j] = sim[j, i] = v
+            key = (min(ids[i], ids[j]), max(ids[i], ids[j]))
+            if key in cache:
+                sim[i, j] = sim[j, i] = cache[key]
             else:
                 pairs.append((i, j))
 
@@ -835,12 +848,14 @@ def _music_matrix(audios: list[dict | None], ids: list[int], store: Store, n_job
             i, j = ij
             return i, j, audio.music_similarity(audios[i], audios[j])
 
-        results = Parallel(n_jobs=n_jobs or min(4, os.cpu_count() or 4), prefer="threads")(
+        results = Parallel(n_jobs=n_jobs or min(8, os.cpu_count() or 4), prefer="threads")(
             delayed(_c)(p) for p in pairs
         )
+        new_pairs = []
         for i, j, v in results:
             sim[i, j] = sim[j, i] = v
-            store.set_pair(ids[i], ids[j], "music", v)
+            new_pairs.append((ids[i], ids[j], v))
+        store.set_pairs_batch("music", new_pairs)  # 批量写
     return sim
 
 

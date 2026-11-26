@@ -18,3 +18,9 @@ models/*.task
 build/
 dist/
 *.spec.bak
+
+# SQLite 数据库（测试残留）
+*.db
+
+# 本地测试数据
+test-data/
